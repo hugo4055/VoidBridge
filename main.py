@@ -5,6 +5,7 @@ import logging
 import os
 import sqlite3
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import quote
 
@@ -47,20 +48,29 @@ BRIDGES = CONFIG.get("bridges", [])
 MAX_UPLOAD = int(CONFIG.get("max_upload_mb", 20)) * 1024 * 1024
 ANNOUNCE_VOICE = bool(CONFIG.get("announce_discord_voice", False))
 
+@contextmanager
 def db():
-    con = sqlite3.connect(BASE / "state.sqlite3")
-    con.execute("""CREATE TABLE IF NOT EXISTS message_map (
-        source_platform TEXT NOT NULL,
-        source_id TEXT NOT NULL,
-        destination_platform TEXT NOT NULL,
-        destination_id TEXT NOT NULL,
-        discord_channel_id TEXT,
-        golive_group_id TEXT,
-        golive_channel_id TEXT,
-        PRIMARY KEY(source_platform, source_id)
-    )""")
-    con.commit()
-    return con
+    # O context manager padrão do sqlite faz commit/rollback, mas não fecha
+    # a conexão. Fechar explicitamente evita acumular conexões abertas.
+    con = sqlite3.connect(BASE / "state.sqlite3", timeout=15)
+    try:
+        con.execute("""CREATE TABLE IF NOT EXISTS message_map (
+            source_platform TEXT NOT NULL,
+            source_id TEXT NOT NULL,
+            destination_platform TEXT NOT NULL,
+            destination_id TEXT NOT NULL,
+            discord_channel_id TEXT,
+            golive_group_id TEXT,
+            golive_channel_id TEXT,
+            PRIMARY KEY(source_platform, source_id)
+        )""")
+        yield con
+        con.commit()
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
 
 def save_map(source_platform, source_id, destination_platform, destination_id,
              discord_channel_id=None, group_id=None, channel_id=None):
@@ -102,6 +112,13 @@ def clean_text(text, limit=5900):
     text = (text or "").strip()
     return text[:limit]
 
+class GoLiveAPIError(RuntimeError):
+    def __init__(self, status, data):
+        self.status = status
+        self.data = data
+        super().__init__(f"GoLive HTTP {status}: {data}")
+
+
 class GoLiveAPI:
     def __init__(self, session):
         self.session = session
@@ -117,7 +134,7 @@ class GoLiveAPI:
             except json.JSONDecodeError:
                 data = {"raw": body[:500]}
             if response.status >= 400:
-                raise RuntimeError(f"GoLive HTTP {response.status}: {data}")
+                raise GoLiveAPIError(response.status, data)
             return data
 
     async def verify(self):
@@ -228,7 +245,10 @@ async def handle_golive_event(event):
 
     if kind == "register-error":
         golive_ready.clear()
-        log.error("GoLive recusou o token: %s", event.get("message"))
+        if event.get("retryable", False):
+            log.warning("GoLive informou erro temporário no registro: %s", event.get("message"))
+        else:
+            log.error("GoLive recusou o registro: %s", event.get("message"))
         return
 
     if kind == "banned":
@@ -322,8 +342,14 @@ async def golive_gateway_loop():
                     except json.JSONDecodeError:
                         continue
                     await handle_golive_event(event)
-                    if event.get("type") in ("register-error", "banned"):
-                        log.error("Autenticação GoLive recusada; verifique o token no .env.")
+                    if event.get("type") == "register-error":
+                        if event.get("retryable", False):
+                            log.warning("Erro temporário no Gateway; a conexão será refeita.")
+                            break
+                        log.error("Registro recusado pelo GoLive. Confira o token e as permissões.")
+                        return
+                    if event.get("type") == "banned":
+                        log.error("O bot foi banido do GoLive; interrompendo a conexão.")
                         return
         except asyncio.CancelledError:
             raise
@@ -504,7 +530,18 @@ async def main():
     async with aiohttp.ClientSession(timeout=timeout) as session:
         http_session = session
         golive_api = GoLiveAPI(session)
-        await golive_api.verify()
+        # A API pode responder 503 retryable durante uma inicialização/manutenção.
+        # Nessa situação aguardamos e tentamos novamente, sem derrubar o bot.
+        while True:
+            try:
+                await golive_api.verify()
+                break
+            except GoLiveAPIError as exc:
+                if exc.status == 503 and isinstance(exc.data, dict) and exc.data.get("retryable"):
+                    log.warning("API GoLive temporariamente indisponível; nova tentativa em 10 segundos.")
+                    await asyncio.sleep(10)
+                    continue
+                raise
         await bot.start(DISCORD_TOKEN)
 
 if __name__ == "__main__":
