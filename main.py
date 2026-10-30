@@ -1453,7 +1453,11 @@ async def ensure_voice_room(voice_channel):
     channel_id = int(voice_channel.id)
     task = voice_room_tasks.get(channel_id)
     if task and not task.done():
-        return False
+        existing_stop = voice_room_stop_events.get(channel_id)
+        if not existing_stop or not existing_stop.is_set():
+            return False
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
     stop_event = asyncio.Event()
     voice_room_stop_events[channel_id] = stop_event
@@ -1466,7 +1470,11 @@ async def ensure_voice_room(voice_channel):
 
 
 async def stop_voice_room(channel_id):
-    stop_event = voice_room_stop_events.get(int(channel_id))
+    channel_id = int(channel_id)
+    row = get_structure_map_by_discord("voice_room", channel_id)
+    if row:
+        save_structure_map("voice_room", channel_id, row[1], "pending")
+    stop_event = voice_room_stop_events.get(channel_id)
     if stop_event:
         stop_event.set()
 
