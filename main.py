@@ -1,20 +1,24 @@
 import asyncio
 import base64
+import hashlib
 import json
 import logging
 import os
+import secrets
 import sqlite3
+import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 import aiohttp
+from aiohttp import web
 import discord
+from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 import websockets
-
 BASE = Path(__file__).resolve().parent
 load_dotenv(BASE / ".env")
 CONFIG = json.loads((BASE / "config.json").read_text(encoding="utf-8"))
@@ -23,6 +27,12 @@ API = "https://apigolive.nemtudo.me"
 GATEWAY = "wss://apigolive.nemtudo.me/ws"
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 GOLIVE_TOKEN = os.getenv("GOLIVE_TOKEN", "").strip()
+GOLIVE_OAUTH_CLIENT_ID = os.getenv("GOLIVE_OAUTH_CLIENT_ID", "").strip()
+GOLIVE_OAUTH_CLIENT_SECRET = os.getenv("GOLIVE_OAUTH_CLIENT_SECRET", "").strip()
+OAUTH_REDIRECT_URI = os.getenv(
+    "GOLIVE_OAUTH_REDIRECT_URI",
+    "https://voidbridge.onrender.com/oauth/golive/callback"
+).strip()
 if not DISCORD_TOKEN or not GOLIVE_TOKEN:
     raise SystemExit("Preencha DISCORD_TOKEN e GOLIVE_TOKEN no arquivo .env")
 
@@ -71,6 +81,14 @@ def db():
             entity_type TEXT NOT NULL, discord_id TEXT NOT NULL, golive_id TEXT NOT NULL,
             last_name TEXT NOT NULL, PRIMARY KEY(entity_type, discord_id),
             UNIQUE(entity_type, golive_id)
+        )""")
+        con.execute("""CREATE TABLE IF NOT EXISTS oauth_states (
+            state TEXT PRIMARY KEY, discord_id TEXT NOT NULL,
+            code_verifier TEXT NOT NULL, expires_at INTEGER NOT NULL
+        )""")
+        con.execute("""CREATE TABLE IF NOT EXISTS account_links (
+            discord_id TEXT PRIMARY KEY, golive_user_id TEXT NOT NULL UNIQUE,
+            golive_username TEXT, linked_at INTEGER NOT NULL
         )""")
         yield con
         con.commit()
@@ -518,6 +536,13 @@ async def sync_structure():
 @bot.event
 async def on_ready():
     log.info("Discord conectado como %s", bot.user)
+    if not getattr(bot, "_commands_synced", False):
+        try:
+            await bot.tree.sync()
+            bot._commands_synced = True
+            log.info("Comandos /vincular e /vinculo sincronizados.")
+        except Exception:
+            log.exception("Não foi possível sincronizar os comandos slash.")
     if not getattr(bot, "_golive_started", False):
         bot._golive_started = True
         asyncio.create_task(golive_gateway_loop())
@@ -668,12 +693,173 @@ async def bridge_status_error(ctx, error):
     if isinstance(error, commands.MissingPermissions):
         await ctx.reply("Você precisa da permissão Gerenciar Servidor para usar esse comando.")
 
+
+def create_oauth_link(discord_id):
+    if not GOLIVE_OAUTH_CLIENT_ID or not GOLIVE_OAUTH_CLIENT_SECRET:
+        raise RuntimeError("OAuth do GoLive ainda não foi configurado no Render.")
+    state = secrets.token_urlsafe(32)
+    verifier = secrets.token_urlsafe(64)
+    challenge = base64.urlsafe_b64encode(
+        hashlib.sha256(verifier.encode("ascii")).digest()
+    ).rstrip(b"=").decode("ascii")
+    with db() as con:
+        con.execute("DELETE FROM oauth_states WHERE expires_at < ?", (int(time.time()),))
+        con.execute(
+            "INSERT INTO oauth_states VALUES (?, ?, ?, ?)",
+            (state, str(discord_id), verifier, int(time.time()) + 600),
+        )
+    params = {
+        "client_id": GOLIVE_OAUTH_CLIENT_ID,
+        "response_type": "code",
+        "redirect_uri": OAUTH_REDIRECT_URI,
+        "scope": "identify",
+        "state": state,
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+    }
+    return "https://golive.nemtudo.me/oauth2/authorize?" + urlencode(params)
+
+
+def take_oauth_state(state):
+    with db() as con:
+        row = con.execute(
+            "SELECT discord_id, code_verifier, expires_at FROM oauth_states WHERE state=?",
+            (state,),
+        ).fetchone()
+        if row:
+            con.execute("DELETE FROM oauth_states WHERE state=?", (state,))
+    if not row or row[2] < int(time.time()):
+        return None
+    return row
+
+
+async def golive_oauth_callback(request):
+    if not GOLIVE_OAUTH_CLIENT_ID or not GOLIVE_OAUTH_CLIENT_SECRET:
+        return web.Response(text="OAuth ainda não configurado no servidor.", status=503)
+    error = request.query.get("error")
+    if error:
+        return web.Response(
+            text="A autorização foi cancelada ou recusada. Volte ao Discord e use /vincular novamente.",
+            content_type="text/plain",
+        )
+    code = request.query.get("code", "")
+    state = request.query.get("state", "")
+    if not code or not state:
+        return web.Response(text="Resposta OAuth incompleta.", status=400)
+    pending = take_oauth_state(state)
+    if not pending:
+        return web.Response(text="Link expirado ou inválido. Volte ao Discord e use /vincular novamente.", status=400)
+    discord_id, verifier, _expires = pending
+    try:
+        async with http_session.post(
+            API + "/oauth2/token",
+            data={
+                "grant_type": "authorization_code",
+                "client_id": GOLIVE_OAUTH_CLIENT_ID,
+                "client_secret": GOLIVE_OAUTH_CLIENT_SECRET,
+                "code": code,
+                "redirect_uri": OAUTH_REDIRECT_URI,
+                "code_verifier": verifier,
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        ) as response:
+            token_data = await response.json(content_type=None)
+            if response.status >= 400:
+                log.error("GoLive OAuth token exchange falhou: HTTP %s", response.status)
+                return web.Response(text="Não foi possível concluir o login no GoLive. Tente /vincular novamente.", status=502)
+        access_token = token_data.get("access_token")
+        if not access_token:
+            log.error("GoLive OAuth não retornou access_token.")
+            return web.Response(text="O GoLive não retornou uma autorização válida.", status=502)
+        async with http_session.get(
+            API + "/users/@me",
+            headers={"Authorization": f"Bearer {access_token}"},
+        ) as response:
+            user_data = await response.json(content_type=None)
+            if response.status >= 400:
+                log.error("GoLive /users/@me falhou: HTTP %s", response.status)
+                return web.Response(text="Não foi possível identificar sua conta GoLive.", status=502)
+        user = user_data.get("user", user_data.get("account", user_data))
+        golive_id = user.get("id")
+        username = user.get("username") or user.get("displayName") or "GoLive"
+        if not golive_id:
+            log.error("Resposta /users/@me sem ID de usuário: %s", user_data)
+            return web.Response(text="O GoLive não informou o ID da conta.", status=502)
+        with db() as con:
+            existing = con.execute(
+                "SELECT discord_id FROM account_links WHERE golive_user_id=?",
+                (str(golive_id),),
+            ).fetchone()
+            if existing and existing[0] != discord_id:
+                return web.Response(
+                    text="Esta conta GoLive já está vinculada a outra conta Discord. Contate a administração.",
+                    status=409,
+                )
+            con.execute(
+                """INSERT INTO account_links(discord_id, golive_user_id, golive_username, linked_at)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(discord_id) DO UPDATE SET
+                   golive_user_id=excluded.golive_user_id,
+                   golive_username=excluded.golive_username,
+                   linked_at=excluded.linked_at""",
+                (discord_id, str(golive_id), str(username), int(time.time())),
+            )
+        # Não armazenamos access_token nem refresh_token: só precisamos da identidade estável.
+        return web.Response(
+            text=f"Conta GoLive @{username} vinculada com sucesso! Você já pode voltar ao Discord.",
+            content_type="text/plain",
+        )
+    except Exception:
+        log.exception("Erro durante callback OAuth do GoLive.")
+        return web.Response(text="Ocorreu um erro ao concluir o vínculo. Tente novamente.", status=500)
+
+
+@bot.tree.command(name="vincular", description="Vincula sua conta GoLive à sua conta Discord.")
+async def link_golive_account(interaction: discord.Interaction):
+    try:
+        url = create_oauth_link(interaction.user.id)
+    except RuntimeError as exc:
+        await interaction.response.send_message(str(exc), ephemeral=True)
+        return
+    await interaction.response.send_message(
+        "Abra este link para autorizar sua conta GoLive. O link expira em 10 minutos e só pode ser usado por esta conta Discord:\\n"
+        + url,
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="vinculo", description="Mostra se sua conta GoLive está vinculada.")
+async def show_golive_link(interaction: discord.Interaction):
+    with db() as con:
+        row = con.execute(
+            "SELECT golive_username FROM account_links WHERE discord_id=?",
+            (str(interaction.user.id),),
+        ).fetchone()
+    if row:
+        await interaction.response.send_message(
+            f"Sua conta está vinculada ao GoLive @{row[0]}.",
+            ephemeral=True,
+        )
+    else:
+        await interaction.response.send_message(
+            "Sua conta GoLive ainda não está vinculada. Use /vincular.",
+            ephemeral=True,
+        )
+
+
 async def main():
     global http_session, golive_api
     timeout = aiohttp.ClientTimeout(total=45)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         http_session = session
         golive_api = GoLiveAPI(session)
+        app = web.Application()
+        app.router.add_get("/oauth/golive/callback", golive_oauth_callback)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", "10000")))
+        await site.start()
+        log.info("Callback OAuth disponível em %s", OAUTH_REDIRECT_URI)
         # A API pode responder 503 retryable durante uma inicialização/manutenção.
         # Nessa situação aguardamos e tentamos novamente, sem derrubar o bot.
         while True:
