@@ -1318,6 +1318,61 @@ def consume_link_code(code, golive_user):
     return f"Conta @{username} vinculada com sucesso ao Discord! Você já pode voltar ao Discord."
 
 
+@bot.tree.command(name="bridge_status", description="Mostra o estado da ponte Discord ↔ GoLive.")
+async def bridge_status_slash(interaction: discord.Interaction):
+    if not interaction.guild or str(interaction.guild.id) != DISCORD_GROUP_ID:
+        await interaction.response.send_message("Este comando só funciona no servidor conectado ao VoidBridge.", ephemeral=True)
+        return
+    if not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message("Você precisa da permissão Gerenciar Servidor.", ephemeral=True)
+        return
+    state = "conectado" if golive_ready.is_set() else "reconectando/desconectado"
+    await interaction.response.send_message(
+        f"**VoidBridge**\nDiscord: conectado como {bot.user}\nGoLive: {state}\n"
+        f"Grupo GoLive: `{GOLIVE_GROUP_ID}`\n"
+        "Canais de texto/voz e cargos: sincronização automática ativada.\n"
+        "Áudio de chamadas: não é retransmitido pelo VoidBridge.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="bridge_sync", description="Solicita uma sincronização de canais e cargos.")
+async def bridge_sync_slash(interaction: discord.Interaction):
+    if not interaction.guild or str(interaction.guild.id) != DISCORD_GROUP_ID:
+        await interaction.response.send_message("Este comando só funciona no servidor conectado ao VoidBridge.", ephemeral=True)
+        return
+    if not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message("Você precisa da permissão Gerenciar Servidor.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    await sync_structure()
+    await interaction.followup.send(
+        "Solicitei a sincronização de categorias, canais de texto/voz e cargos. "
+        "Se alguma permissão ou acesso da API estiver faltando, o motivo ficará nos logs do Render.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="bridge_config", description="Mostra quais recursos estão configurados na ponte.")
+async def bridge_config_slash(interaction: discord.Interaction):
+    if not interaction.guild or str(interaction.guild.id) != DISCORD_GROUP_ID:
+        await interaction.response.send_message("Este comando só funciona no servidor conectado ao VoidBridge.", ephemeral=True)
+        return
+    if not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message("Você precisa da permissão Gerenciar Servidor.", ephemeral=True)
+        return
+    await interaction.response.send_message(
+        "**Configuração atual do VoidBridge**\n"
+        "• Mensagens: Discord ↔ GoLive\n"
+        "• Categorias e canais de texto/voz: sincronização automática\n"
+        "• Cargos: sincronização automática de nome, cor e permissões equivalentes\n"
+        "• Exclusões: não são replicadas automaticamente\n"
+        "• Áudio de chamadas: não disponível nesta integração\n"
+        "• Salas de transmissão GoLive: ainda dependem da integração oficial de salas; não vou simular uma chamada.",
+        ephemeral=True,
+    )
+
+
 @bot.tree.command(name="vincular", description="Gera um código para vincular sua conta GoLive.")
 async def link_golive_account(interaction: discord.Interaction):
     code = create_link_code(interaction.user.id)
