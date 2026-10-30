@@ -12,6 +12,7 @@ Sincroniza a estrutura de um servidor Discord inteiro com um grupo GoLive usando
 - Anexos e imagens dentro dos limites das plataformas.
 - Edições e exclusões de mensagens quando há mapeamento.
 - Mapeamento persistente em SQLite para reduzir duplicações.
+- Vínculo individual Discord ↔ GoLive por OAuth2 (`/vincular`) e consulta (`/vinculo`); o callback usa `state` e PKCE e guarda apenas os IDs das contas, sem persistir tokens OAuth.
 
 ## Proteção dos canais existentes
 
@@ -28,7 +29,7 @@ Edite config.json (o repositório já contém os IDs informados):
 }
 ```
 
-Tokens continuam no arquivo .env: DISCORD_TOKEN e GOLIVE_TOKEN.
+Tokens continuam no arquivo `.env`: `DISCORD_TOKEN` e `GOLIVE_TOKEN`. Para o vínculo de contas, configure também `GOLIVE_OAUTH_CLIENT_ID`, `GOLIVE_OAUTH_CLIENT_SECRET` e `GOLIVE_OAUTH_REDIRECT_URI` no ambiente do servidor. O callback padrão é `https://voidbridge.onrender.com/oauth/golive/callback`.
 
 ## Instalação no Windows
 
@@ -46,7 +47,7 @@ Tokens continuam no arquivo .env: DISCORD_TOKEN e GOLIVE_TOKEN.
 
 ## Limitações
 
-Sem áudio, câmera, compartilhamento de tela ou chamadas. Não espelha cargos, permissões, membros, presença, reações ou threads. Canais de fórum, palco e outros tipos especiais do Discord não são copiados. Mensagens antigas não são importadas; a sincronização começa quando o bot está online. O computador que executa o bot precisa permanecer ligado.
+Sem áudio, câmera, compartilhamento de tela ou chamadas. A sincronização de cargos e permissões ainda não está incluída; o OAuth apenas associa as identidades de forma segura. Não espelha presença, reações ou threads. Canais de fórum, palco e outros tipos especiais do Discord não são copiados. Mensagens antigas não são importadas; a sincronização começa quando o bot está online. O computador que executa o bot precisa permanecer ligado.
 
 ## Segurança
 
