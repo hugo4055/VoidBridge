@@ -1,0 +1,14 @@
+{
+  "bridges": [
+    {
+      "discord_channel_id": "COLOQUE_ID_DO_CANAL_DISCORD",
+      "golive_group_id": "COLOQUE_ID_DO_GRUPO_GOLIVE",
+      "golive_channel_id": "COLOQUE_ID_DA_SALA_GOLIVE"
+    }
+  ],
+  "discord_prefix": "[Discord]",
+  "golive_prefix": "[GoLive]",
+  "max_upload_mb": 20,
+  "announce_discord_voice": false,
+  "announce_golive_voice": false
+}
