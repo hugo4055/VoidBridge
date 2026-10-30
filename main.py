@@ -1874,6 +1874,10 @@ async def main():
             if task and not task.done():
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
+            await stop_all_voice_rooms()
+            room_tasks = list(voice_room_tasks.values())
+            if room_tasks:
+                await asyncio.gather(*room_tasks, return_exceptions=True)
             try:
                 release_leader_lease()
                 log.info("Concessão de líder liberada.")
