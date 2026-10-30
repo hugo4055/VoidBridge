@@ -529,7 +529,7 @@ async def golive_gateway_loop():
         try:
             log.info("Conectando ao Gateway GoLive...")
             async with websockets.connect(
-                GATEWAY, ping_interval=25, ping_timeout=25, close_timeout=5
+                GATEWAY, ping_interval=25, ping_timeout=25, close_timeout=5, open_timeout=10
             ) as ws:
                 await ws.send(json.dumps({"type": "register", "token": GOLIVE_CREDENTIAL}))
                 async for raw in ws:
@@ -1365,7 +1365,7 @@ async def _voice_room_worker(channel_id, guild_id, stop_event):
             retry_connection = False
             try:
                 async with websockets.connect(
-                    GATEWAY, ping_interval=25, ping_timeout=25, close_timeout=5
+                    GATEWAY, ping_interval=25, ping_timeout=25, close_timeout=5, open_timeout=10
                 ) as ws:
                     await ws.send(json.dumps({"type": "register", "token": GOLIVE_CREDENTIAL}))
                     joined = False
@@ -1606,7 +1606,7 @@ async def bridge_status_slash(interaction: discord.Interaction):
         f"**VoidBridge**\nDiscord: conectado como {bot.user}\nGoLive: {state}\n"
         f"Grupo GoLive: `{GOLIVE_GROUP_ID}`\n"
         "Canais de texto/voz e cargos: sincronização automática ativada.\n"
-        "Áudio de chamadas: não é retransmitido pelo VoidBridge.",
+        "Mídia de chamadas (áudio/vídeo/tela): não é retransmitida pelo VoidBridge.",
         ephemeral=True,
     )
 
@@ -1656,7 +1656,7 @@ def bridge_config_embed(guild, settings):
     )
     embed.add_field(
         name="Áudio",
-        value="O áudio do Discord não é retransmitido. A sala GoLive é independente.",
+        value="Áudio, vídeo e compartilhamento de tela do Discord não são retransmitidos. A sala GoLive é independente.",
         inline=False,
     )
     return embed
