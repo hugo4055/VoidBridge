@@ -5,10 +5,10 @@ Ponte de mensagens entre canais de texto do Discord e salas de texto de grupos d
 ## O que esta versão faz
 
 - Sincroniza mensagens de texto nos dois sentidos.
-- Encaminha arquivos anexados em mensagens (upload/download, respeitando os limites das plataformas).
+- Encaminha imagens e arquivos anexados em mensagens (upload/download, respeitando os limites das plataformas).
 - Sincroniza exclusões de mensagens quando o mapeamento existe.
-- Atualiza a mensagem no Discord quando uma mensagem do GoLive é editada.
-- Para edição feita no Discord, recria a mensagem no GoLive porque a API documentada do GoLive não oferece edição de mensagem.
+- Atualiza mensagens editadas nos dois sentidos (Discord ↔ GoLive).
+- Sincroniza edições nos dois sentidos usando a rota PATCH de mensagens do GoLive.
 - Registra entrada/saída de voz do Discord como aviso de texto opcional.
 - Reconecta ao Gateway do GoLive automaticamente.
 - Usa SQLite para mapear mensagens e evitar loops.
@@ -21,7 +21,7 @@ Não retransmite áudio, câmera, compartilhamento de tela nem chamadas. Também
 ## Instalação no Windows
 
 1. Baixe o projeto por **Code → Download ZIP** e extraia.
-2. Instale Python 3.12 em https://www.python.org/downloads/ e marque **Add Python to PATH**.
+2. Instale Python 3.12 em https://www.python.org/downloads/ e marque **Add Python to PATH**. O iniciador usa Python 3.12 se estiver instalado; caso contrário, tenta a versão padrão do Python.
 3. Execute `INSTALAR.bat`.
 4. Renomeie `.env.example` para `.env` e preencha os dois tokens.
 5. Edite `config.json` com os IDs dos canais.
@@ -40,7 +40,7 @@ Não retransmite áudio, câmera, compartilhamento de tela nem chamadas. Também
 ## Criar e adicionar o bot GoLive
 
 1. Acesse https://golive.nemtudo.me/developers.
-2. Crie um bot e copie o token para `GOLIVE_TOKEN`. Não publique esse token.
+2. Crie um bot e copie o token para `GOLIVE_TOKEN`. O portal copia o valor com o prefixo `Bot `; o VoidBridge também aceita o token sem esse prefixo e normaliza automaticamente. Não publique esse token.
 3. Use a aba **Instalação** do portal para adicioná-lo ao grupo.
 4. Abra a sala de texto no navegador. O endereço tem o formato `/groups/ID_DO_GRUPO/ID_DA_SALA`.
 5. Copie os IDs para `config.json`.
@@ -88,7 +88,7 @@ O PC precisa ficar ligado e conectado à internet para o bot funcionar.
 ## Solução de problemas
 
 - **Discord não lê mensagens:** confira Message Content Intent no Developer Portal.
-- **401 GoLive:** token inválido/revogado; confira o token no `.env`.
+- **401 GoLive:** confira se copiou o token do bot na aba Token do Portal do Desenvolvedor, sem `Bearer`. O prefixo `Bot ` é aceito com ou sem ele no `.env`. Se gerou um token novo, atualize o `.env`.
 - **Bot não recebe eventos:** confirme que foi adicionado ao grupo e tem acesso à sala.
 - **403 ao enviar:** confira a permissão `sendMessages` do bot na sala GoLive.
 - **Anexo não encaminha:** confira Attach Files no Discord e permissões/limites de upload no GoLive.
