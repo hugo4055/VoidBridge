@@ -1,5 +1,4 @@
 import asyncio
-import base64
 import hashlib
 import json
 import logging
@@ -10,7 +9,7 @@ import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
-from urllib.parse import quote, urlencode
+from urllib.parse import quote
 
 import aiohttp
 from aiohttp import web
@@ -82,9 +81,9 @@ def db():
             last_name TEXT NOT NULL, PRIMARY KEY(entity_type, discord_id),
             UNIQUE(entity_type, golive_id)
         )""")
-        con.execute("""CREATE TABLE IF NOT EXISTS oauth_states (
-            state TEXT PRIMARY KEY, discord_id TEXT NOT NULL,
-            code_verifier TEXT NOT NULL, expires_at INTEGER NOT NULL
+        con.execute("""CREATE TABLE IF NOT EXISTS link_codes (
+            code_hash TEXT PRIMARY KEY, discord_id TEXT NOT NULL,
+            expires_at INTEGER NOT NULL
         )""")
         con.execute("""CREATE TABLE IF NOT EXISTS account_links (
             discord_id TEXT PRIMARY KEY, golive_user_id TEXT NOT NULL UNIQUE,
@@ -330,6 +329,20 @@ async def handle_golive_event(event):
         author = event.get("author", {})
         if author.get("bot"):
             return
+        # Comando de vinculação: /vincular ABC-123, em uma sala do grupo GoLive.
+        if str(message.get("groupId") or event.get("groupId") or "") == GOLIVE_GROUP_ID:
+            command_text = str(message.get("text") or "").strip()
+            match = __import__("re").fullmatch(r"/vincular\s+([A-Za-z0-9]{3}-[A-Za-z0-9]{3})", command_text, flags=__import__("re").IGNORECASE)
+            if match:
+                result_text = consume_link_code(match.group(1), author)
+                try:
+                    await golive_api.send_message(
+                        GOLIVE_GROUP_ID, str(message.get("channelId")),
+                        f"🔐 {result_text}"
+                    )
+                except Exception:
+                    log.exception("Não consegui responder ao comando /vincular no GoLive.")
+                return
         bridge = bridge_for_golive(message.get("groupId"), message.get("channelId"))
         if not bridge:
             return
@@ -694,136 +707,94 @@ async def bridge_status_error(ctx, error):
         await ctx.reply("Você precisa da permissão Gerenciar Servidor para usar esse comando.")
 
 
-def create_oauth_link(discord_id):
-    if not GOLIVE_OAUTH_CLIENT_ID or not GOLIVE_OAUTH_CLIENT_SECRET:
-        raise RuntimeError("OAuth do GoLive ainda não foi configurado no Render.")
-    state = secrets.token_urlsafe(32)
-    verifier = secrets.token_urlsafe(64)
-    challenge = base64.urlsafe_b64encode(
-        hashlib.sha256(verifier.encode("ascii")).digest()
-    ).rstrip(b"=").decode("ascii")
+LINK_CODE_TTL = 600
+LINK_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+
+
+def create_link_code(discord_id):
+    """Gera um código de uso único; somente o hash fica salvo no SQLite."""
     with db() as con:
-        con.execute("DELETE FROM oauth_states WHERE expires_at < ?", (int(time.time()),))
-        con.execute(
-            "INSERT INTO oauth_states VALUES (?, ?, ?, ?)",
-            (state, str(discord_id), verifier, int(time.time()) + 600),
-        )
-    params = {
-        "client_id": GOLIVE_OAUTH_CLIENT_ID,
-        "response_type": "code",
-        "redirect_uri": OAUTH_REDIRECT_URI,
-        "scope": "identify",
-        "state": state,
-        "code_challenge": challenge,
-        "code_challenge_method": "S256",
-    }
-    return "https://golive.nemtudo.me/oauth2/authorize?" + urlencode(params)
+        con.execute("DELETE FROM link_codes WHERE expires_at < ?", (int(time.time()),))
+        con.execute("DELETE FROM link_codes WHERE discord_id=?", (str(discord_id),))
+        for _ in range(20):
+            raw = "".join(secrets.choice(LINK_CODE_ALPHABET) for _ in range(6))
+            code = raw[:3] + "-" + raw[3:]
+            digest = hashlib.sha256(code.encode("ascii")).hexdigest()
+            try:
+                con.execute(
+                    "INSERT INTO link_codes(code_hash, discord_id, expires_at) VALUES (?, ?, ?)",
+                    (digest, str(discord_id), int(time.time()) + LINK_CODE_TTL),
+                )
+                return code
+            except sqlite3.IntegrityError:
+                continue
+    raise RuntimeError("Não foi possível gerar um código único. Tente novamente.")
 
 
-def take_oauth_state(state):
+def invalidate_link_code(discord_id):
+    with db() as con:
+        con.execute("DELETE FROM link_codes WHERE discord_id=?", (str(discord_id),))
+
+
+def consume_link_code(code, golive_user):
+    normalized = str(code).strip().upper()
+    digest = hashlib.sha256(normalized.encode("ascii", errors="ignore")).hexdigest()
+    now = int(time.time())
     with db() as con:
         row = con.execute(
-            "SELECT discord_id, code_verifier, expires_at FROM oauth_states WHERE state=?",
-            (state,),
+            "SELECT discord_id, expires_at FROM link_codes WHERE code_hash=?",
+            (digest,),
         ).fetchone()
-        if row:
-            con.execute("DELETE FROM oauth_states WHERE state=?", (state,))
-    if not row or row[2] < int(time.time()):
-        return None
-    return row
-
-
-async def golive_oauth_callback(request):
-    if not GOLIVE_OAUTH_CLIENT_ID or not GOLIVE_OAUTH_CLIENT_SECRET:
-        return web.Response(text="OAuth ainda não configurado no servidor.", status=503)
-    error = request.query.get("error")
-    if error:
-        return web.Response(
-            text="A autorização foi cancelada ou recusada. Volte ao Discord e use /vincular novamente.",
-            content_type="text/plain",
-        )
-    code = request.query.get("code", "")
-    state = request.query.get("state", "")
-    if not code or not state:
-        return web.Response(text="Resposta OAuth incompleta.", status=400)
-    pending = take_oauth_state(state)
-    if not pending:
-        return web.Response(text="Link expirado ou inválido. Volte ao Discord e use /vincular novamente.", status=400)
-    discord_id, verifier, _expires = pending
-    try:
-        async with http_session.post(
-            API + "/oauth2/token",
-            data={
-                "grant_type": "authorization_code",
-                "client_id": GOLIVE_OAUTH_CLIENT_ID,
-                "client_secret": GOLIVE_OAUTH_CLIENT_SECRET,
-                "code": code,
-                "redirect_uri": OAUTH_REDIRECT_URI,
-                "code_verifier": verifier,
-            },
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-        ) as response:
-            token_data = await response.json(content_type=None)
-            if response.status >= 400:
-                log.error("GoLive OAuth token exchange falhou: HTTP %s", response.status)
-                return web.Response(text="Não foi possível concluir o login no GoLive. Tente /vincular novamente.", status=502)
-        access_token = token_data.get("access_token")
-        if not access_token:
-            log.error("GoLive OAuth não retornou access_token.")
-            return web.Response(text="O GoLive não retornou uma autorização válida.", status=502)
-        async with http_session.get(
-            API + "/users/@me",
-            headers={"Authorization": f"Bearer {access_token}"},
-        ) as response:
-            user_data = await response.json(content_type=None)
-            if response.status >= 400:
-                log.error("GoLive /users/@me falhou: HTTP %s", response.status)
-                return web.Response(text="Não foi possível identificar sua conta GoLive.", status=502)
-        user = user_data.get("user", user_data.get("account", user_data))
-        golive_id = user.get("id")
-        username = user.get("username") or user.get("displayName") or "GoLive"
+        if not row:
+            return "Código inválido ou já utilizado. Gere outro com /vincular no Discord."
+        discord_id, expires_at = row
+        con.execute("DELETE FROM link_codes WHERE code_hash=?", (digest,))
+        if expires_at < now:
+            return "Esse código expirou. Volte ao Discord e use /vincular para gerar outro."
+        golive_id = str(golive_user.get("id") or "")
         if not golive_id:
-            log.error("Resposta /users/@me sem ID de usuário: %s", user_data)
-            return web.Response(text="O GoLive não informou o ID da conta.", status=502)
-        with db() as con:
-            existing = con.execute(
-                "SELECT discord_id FROM account_links WHERE golive_user_id=?",
-                (str(golive_id),),
-            ).fetchone()
-            if existing and existing[0] != discord_id:
-                return web.Response(
-                    text="Esta conta GoLive já está vinculada a outra conta Discord. Contate a administração.",
-                    status=409,
-                )
-            con.execute(
-                """INSERT INTO account_links(discord_id, golive_user_id, golive_username, linked_at)
-                   VALUES (?, ?, ?, ?)
-                   ON CONFLICT(discord_id) DO UPDATE SET
-                   golive_user_id=excluded.golive_user_id,
-                   golive_username=excluded.golive_username,
-                   linked_at=excluded.linked_at""",
-                (discord_id, str(golive_id), str(username), int(time.time())),
-            )
-        # Não armazenamos access_token nem refresh_token: só precisamos da identidade estável.
-        return web.Response(
-            text=f"Conta GoLive @{username} vinculada com sucesso! Você já pode voltar ao Discord.",
-            content_type="text/plain",
+            return "Não consegui identificar sua conta GoLive. Tente novamente."
+        existing = con.execute(
+            "SELECT discord_id FROM account_links WHERE golive_user_id=?",
+            (golive_id,),
+        ).fetchone()
+        if existing and existing[0] != discord_id:
+            return "Esta conta GoLive já está vinculada a outra conta Discord."
+        username = str(
+            golive_user.get("username") or golive_user.get("name") or "GoLive"
+        )[:100]
+        con.execute(
+            """INSERT INTO account_links(discord_id, golive_user_id, golive_username, linked_at)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(discord_id) DO UPDATE SET
+               golive_user_id=excluded.golive_user_id,
+               golive_username=excluded.golive_username,
+               linked_at=excluded.linked_at""",
+            (discord_id, golive_id, username, now),
         )
-    except Exception:
-        log.exception("Erro durante callback OAuth do GoLive.")
-        return web.Response(text="Ocorreu um erro ao concluir o vínculo. Tente novamente.", status=500)
+    return f"Conta @{username} vinculada com sucesso ao Discord! Você já pode voltar ao Discord."
 
 
-@bot.tree.command(name="vincular", description="Vincula sua conta GoLive à sua conta Discord.")
+@bot.tree.command(name="vincular", description="Gera um código para vincular sua conta GoLive.")
 async def link_golive_account(interaction: discord.Interaction):
+    code = create_link_code(interaction.user.id)
     try:
-        url = create_oauth_link(interaction.user.id)
-    except RuntimeError as exc:
-        await interaction.response.send_message(str(exc), ephemeral=True)
+        await interaction.user.send(
+            "🔐 **VoidBridge — código de vinculação**\n\n"
+            f"Seu código é: **{code}**\n\n"
+            "Agora abra o GoLive e envie em uma sala do grupo conectado:\n"
+            f"/vincular {code}\n\n"
+            "O código expira em 10 minutos e só pode ser usado uma vez. Não compartilhe com ninguém."
+        )
+    except discord.Forbidden:
+        invalidate_link_code(interaction.user.id)
+        await interaction.response.send_message(
+            "Não consegui enviar mensagem privada. Ative as mensagens diretas deste servidor e execute /vincular novamente.",
+            ephemeral=True,
+        )
         return
     await interaction.response.send_message(
-        "Abra este link para autorizar sua conta GoLive. O link expira em 10 minutos e só pode ser usado por esta conta Discord:\\n"
-        + url,
+        "Enviei seu código por mensagem privada. Abra o GoLive e use /vincular XXX-XXX em uma sala do grupo conectado.",
         ephemeral=True,
     )
 
@@ -847,6 +818,10 @@ async def show_golive_link(interaction: discord.Interaction):
         )
 
 
+async def health_check(_request):
+    return web.json_response({"ok": True, "service": "VoidBridge"})
+
+
 async def main():
     global http_session, golive_api
     timeout = aiohttp.ClientTimeout(total=45)
@@ -854,12 +829,12 @@ async def main():
         http_session = session
         golive_api = GoLiveAPI(session)
         app = web.Application()
-        app.router.add_get("/oauth/golive/callback", golive_oauth_callback)
+        app.router.add_get("/health", health_check)
         runner = web.AppRunner(app)
         await runner.setup()
         site = web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", "10000")))
         await site.start()
-        log.info("Callback OAuth disponível em %s", OAUTH_REDIRECT_URI)
+        log.info("Health check disponível em /health; vinculação por código ativada.")
         # A API pode responder 503 retryable durante uma inicialização/manutenção.
         # Nessa situação aguardamos e tentamos novamente, sem derrubar o bot.
         while True:
