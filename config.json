@@ -3,5 +3,5 @@
   "discord_group_id": "1411504431991750718",
   "discord_prefix": "[Discord]",
   "golive_prefix": "[GoLive]",
-  "max_upload_mb": 20
+  "max_upload_mb": 1024
 }
