@@ -19,6 +19,7 @@ from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 import websockets
+from voice_rooms import has_human_members, room_handle_for_discord_channel, room_url
 BASE = Path(__file__).resolve().parent
 load_dotenv(BASE / ".env")
 CONFIG = json.loads((BASE / "config.json").read_text(encoding="utf-8"))
@@ -212,6 +213,45 @@ def save_structure_map(kind, discord_id, golive_id, name):
             ON CONFLICT(entity_type, discord_id) DO UPDATE SET
             golive_id=excluded.golive_id, last_name=excluded.last_name""",
             (kind, str(discord_id), str(golive_id), str(name)))
+
+def get_bridge_settings(guild_id):
+    with db() as con:
+        row = con.execute(
+            """SELECT voice_rooms_enabled, voice_announce_channel_id
+               FROM bridge_settings WHERE guild_id=%s""",
+            (str(guild_id),),
+        ).fetchone()
+    return {
+        "voice_rooms_enabled": True if row is None else bool(row[0]),
+        "voice_announce_channel_id": str(row[1]) if row and row[1] else None,
+    }
+
+
+def set_voice_rooms_enabled(guild_id, enabled, updated_by):
+    with db() as con:
+        con.execute(
+            """INSERT INTO bridge_settings(guild_id, voice_rooms_enabled, updated_by)
+               VALUES (%s, %s, %s)
+               ON CONFLICT (guild_id) DO UPDATE SET
+                   voice_rooms_enabled=EXCLUDED.voice_rooms_enabled,
+                   updated_by=EXCLUDED.updated_by,
+                   updated_at=now()""",
+            (str(guild_id), bool(enabled), str(updated_by)),
+        )
+
+
+def set_voice_announce_channel(guild_id, channel_id, updated_by):
+    with db() as con:
+        con.execute(
+            """INSERT INTO bridge_settings(guild_id, voice_announce_channel_id, updated_by)
+               VALUES (%s, %s, %s)
+               ON CONFLICT (guild_id) DO UPDATE SET
+                   voice_announce_channel_id=EXCLUDED.voice_announce_channel_id,
+                   updated_by=EXCLUDED.updated_by,
+                   updated_at=now()""",
+            (str(guild_id), str(channel_id), str(updated_by)),
+        )
+
 
 def bridge_for_discord(channel_id):
     row = get_structure_map_by_discord("channel", channel_id)
@@ -1079,13 +1119,14 @@ async def on_ready():
         try:
             await bot.tree.sync()
             bot._commands_synced = True
-            log.info("Comandos /vincular e /vinculo sincronizados.")
+            log.info("Comandos slash do VoidBridge sincronizados.")
         except Exception:
             log.exception("Não foi possível sincronizar os comandos slash.")
     if not getattr(bot, "_golive_started", False):
         bot._golive_started = True
         golive_task = asyncio.create_task(golive_gateway_loop())
         asyncio.create_task(sync_structure())
+        asyncio.create_task(start_existing_voice_rooms())
 
 @bot.event
 async def on_guild_channel_create(channel):
@@ -1232,10 +1273,232 @@ async def on_message_edit(before, after):
     except Exception:
         log.exception("Falha ao sincronizar edição Discord → GoLive")
 
+voice_room_tasks = {}
+voice_room_stop_events = {}
+
+
+async def announce_voice_room(voice_channel_id, handle):
+    settings = get_bridge_settings(DISCORD_GROUP_ID)
+    announcement_id = settings.get("voice_announce_channel_id")
+    if not announcement_id:
+        return False
+
+    voice_channel = bot.get_channel(int(voice_channel_id))
+    if not isinstance(voice_channel, discord.VoiceChannel):
+        return False
+
+    row = get_structure_map_by_discord("voice_room", voice_channel_id)
+    if row and row[2] == "announced":
+        return True
+
+    announcement_channel = bot.get_channel(int(announcement_id))
+    if announcement_channel is None:
+        try:
+            announcement_channel = await bot.fetch_channel(int(announcement_id))
+        except Exception:
+            log.warning("Canal de compartilhamento do VoidBridge não está acessível.")
+            return False
+
+    if (
+        not isinstance(announcement_channel, discord.TextChannel)
+        or str(announcement_channel.guild.id) != DISCORD_GROUP_ID
+    ):
+        log.warning("O canal configurado para compartilhar salas GoLive não é um canal de texto válido.")
+        return False
+
+    try:
+        await announcement_channel.send(
+            f"🔗 Sala GoLive para a call **{voice_channel.name}**: {room_url(handle)}",
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        save_structure_map("voice_room", voice_channel.id, handle, "announced")
+        log.info("Link da sala GoLive compartilhado para o canal de voz %s.", voice_channel.id)
+        return True
+    except discord.Forbidden:
+        log.warning("Sem permissão para publicar links no canal configurado do VoidBridge.")
+    except Exception:
+        log.exception("Falha ao compartilhar link da sala GoLive.")
+    return False
+
+
+async def announce_active_voice_rooms(guild):
+    settings = get_bridge_settings(guild.id)
+    if not settings["voice_rooms_enabled"]:
+        return 0
+
+    shared = 0
+    for voice_channel in guild.voice_channels:
+        if not has_human_members(voice_channel.members):
+            continue
+        row = get_structure_map_by_discord("voice_room", voice_channel.id)
+        if row:
+            if row[2] != "announced" and await announce_voice_room(voice_channel.id, row[1]):
+                shared += 1
+        else:
+            await ensure_voice_room(voice_channel)
+    return shared
+
+
+async def _voice_room_worker(channel_id, guild_id, stop_event):
+    current_task = asyncio.current_task()
+    handle = room_handle_for_discord_channel(channel_id)
+    row = get_structure_map_by_discord("voice_room", channel_id)
+    if row and row[1]:
+        handle = str(row[1])
+    else:
+        save_structure_map("voice_room", channel_id, handle, "pending")
+    announced = bool(row and row[2] == "announced")
+
+    try:
+        while not stop_event.is_set():
+            channel = bot.get_channel(int(channel_id))
+            if (
+                not isinstance(channel, discord.VoiceChannel)
+                or str(channel.guild.id) != str(guild_id)
+                or not has_human_members(channel.members)
+            ):
+                break
+
+            retry_connection = False
+            try:
+                async with websockets.connect(
+                    GATEWAY, ping_interval=25, ping_timeout=25, close_timeout=5
+                ) as ws:
+                    await ws.send(json.dumps({"type": "register", "token": GOLIVE_CREDENTIAL}))
+                    joined = False
+
+                    while not stop_event.is_set():
+                        channel = bot.get_channel(int(channel_id))
+                        if (
+                            not isinstance(channel, discord.VoiceChannel)
+                            or not has_human_members(channel.members)
+                        ):
+                            stop_event.set()
+                            break
+
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=5)
+                        except asyncio.TimeoutError:
+                            continue
+
+                        try:
+                            event = json.loads(raw)
+                        except (json.JSONDecodeError, TypeError):
+                            continue
+
+                        event_type = event.get("type")
+                        if event_type == "registered" and not joined:
+                            await ws.send(json.dumps({"type": "join", "room": handle}))
+                            joined = True
+                            log.info("Conexão de sala GoLive iniciada para o canal Discord %s.", channel_id)
+                        elif event_type == "register-error":
+                            if event.get("retryable", False):
+                                retry_connection = True
+                                break
+                            log.error("GoLive recusou a conexão da sala vinculada ao canal %s.", channel_id)
+                            return
+                        elif event_type == "join-error":
+                            log.warning(
+                                "GoLive não aceitou a sala %s: %s",
+                                handle, event.get("message") or event.get("reason") or "erro sem detalhes",
+                            )
+                            return
+                        elif event_type == "room-state":
+                            if not announced:
+                                announced = await announce_voice_room(channel_id, handle)
+                        elif event_type == "banned":
+                            log.error("GoLive bloqueou a conexão de sala do VoidBridge; não vou reconectar.")
+                            return
+                        elif event_type == "room-removed":
+                            log.warning("A sala GoLive %s foi encerrada ou o bot foi removido.", handle)
+                            return
+
+                    if joined:
+                        try:
+                            await ws.send(json.dumps({"type": "leave"}))
+                        except Exception:
+                            pass
+
+                if stop_event.is_set():
+                    break
+                channel = bot.get_channel(int(channel_id))
+                if not isinstance(channel, discord.VoiceChannel) or not has_human_members(channel.members):
+                    break
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning("Conexão da sala GoLive %s caiu: %s", handle, exc)
+
+            if stop_event.is_set() or not retry_connection:
+                break
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=8)
+            except asyncio.TimeoutError:
+                pass
+    finally:
+        if voice_room_tasks.get(int(channel_id)) is current_task:
+            voice_room_tasks.pop(int(channel_id), None)
+            voice_room_stop_events.pop(int(channel_id), None)
+
+
+async def ensure_voice_room(voice_channel):
+    settings = get_bridge_settings(voice_channel.guild.id)
+    if not settings["voice_rooms_enabled"] or not has_human_members(voice_channel.members):
+        return False
+
+    channel_id = int(voice_channel.id)
+    task = voice_room_tasks.get(channel_id)
+    if task and not task.done():
+        return False
+
+    stop_event = asyncio.Event()
+    voice_room_stop_events[channel_id] = stop_event
+    task = asyncio.create_task(
+        _voice_room_worker(channel_id, voice_channel.guild.id, stop_event),
+        name=f"voidbridge-room-{channel_id}",
+    )
+    voice_room_tasks[channel_id] = task
+    return True
+
+
+async def stop_voice_room(channel_id):
+    stop_event = voice_room_stop_events.get(int(channel_id))
+    if stop_event:
+        stop_event.set()
+
+
+async def stop_all_voice_rooms():
+    for stop_event in list(voice_room_stop_events.values()):
+        stop_event.set()
+
+
+async def start_existing_voice_rooms():
+    if not leader_active or bot.is_closed():
+        return
+    guild = bot.get_guild(int(DISCORD_GROUP_ID))
+    if guild is None:
+        return
+    settings = get_bridge_settings(guild.id)
+    if not settings["voice_rooms_enabled"]:
+        return
+    for voice_channel in guild.voice_channels:
+        if has_human_members(voice_channel.members):
+            await ensure_voice_room(voice_channel)
+
+
 @bot.event
 async def on_voice_state_update(member, before, after):
-    # Só sincronizamos a existência/nome dos canais, nunca o áudio.
-    return
+    if str(member.guild.id) != DISCORD_GROUP_ID or member.bot:
+        return
+
+    if before.channel and (
+        after.channel is None or before.channel.id != after.channel.id
+    ):
+        if not has_human_members(before.channel.members):
+            await stop_voice_room(before.channel.id)
+
+    if isinstance(after.channel, discord.VoiceChannel):
+        await ensure_voice_room(after.channel)
 
 @bot.command(name="bridge")
 @commands.has_permissions(manage_guild=True)
@@ -1353,22 +1616,143 @@ async def bridge_sync_slash(interaction: discord.Interaction):
     )
 
 
-@bot.tree.command(name="bridge_config", description="Mostra quais recursos estão configurados na ponte.")
+def bridge_config_embed(guild, settings):
+    enabled = settings["voice_rooms_enabled"]
+    channel_id = settings.get("voice_announce_channel_id")
+    embed = discord.Embed(
+        title="VoidBridge — Configuração",
+        description="Configure a criação de salas GoLive vinculadas às calls do Discord.",
+        color=discord.Colour.blurple(),
+    )
+    embed.add_field(
+        name="Salas GoLive automáticas",
+        value="Ativadas" if enabled else "Desativadas",
+        inline=True,
+    )
+    embed.add_field(
+        name="Canal para compartilhar links",
+        value=f"<#{channel_id}>" if channel_id else "Não selecionado",
+        inline=True,
+    )
+    embed.add_field(
+        name="Como funciona",
+        value=(
+            "Quando alguém entrar em um canal de voz, o VoidBridge cria uma sala GoLive "
+            "e publica um único link no canal escolhido. Não envia uma mensagem para cada participante."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Áudio",
+        value="O áudio do Discord não é retransmitido. A sala GoLive é independente.",
+        inline=False,
+    )
+    return embed
+
+
+class BridgeConfigView(discord.ui.View):
+    def __init__(self, guild_id, settings):
+        super().__init__(timeout=180)
+        self.guild_id = str(guild_id)
+
+        self.toggle_button = discord.ui.Button(
+            label=(
+                "Desativar salas automáticas"
+                if settings["voice_rooms_enabled"]
+                else "Ativar salas automáticas"
+            ),
+            style=(
+                discord.ButtonStyle.danger
+                if settings["voice_rooms_enabled"]
+                else discord.ButtonStyle.success
+            ),
+        )
+        self.toggle_button.callback = self.toggle_voice_rooms
+        self.add_item(self.toggle_button)
+
+        self.channel_select = discord.ui.ChannelSelect(
+            placeholder="Escolha o canal de texto para compartilhar os links",
+            channel_types=[discord.ChannelType.text],
+            min_values=1,
+            max_values=1,
+        )
+        self.channel_select.callback = self.select_announcement_channel
+        self.add_item(self.channel_select)
+
+    async def interaction_check(self, interaction):
+        if (
+            not interaction.guild
+            or str(interaction.guild.id) != self.guild_id
+            or not interaction.user.guild_permissions.manage_guild
+        ):
+            await interaction.response.send_message(
+                "Somente alguém com Gerenciar Servidor pode alterar esta configuração.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    async def toggle_voice_rooms(self, interaction):
+        current = get_bridge_settings(self.guild_id)
+        enabled = not current["voice_rooms_enabled"]
+        set_voice_rooms_enabled(self.guild_id, enabled, interaction.user.id)
+        if enabled:
+            await start_existing_voice_rooms()
+        else:
+            await stop_all_voice_rooms()
+
+        settings = get_bridge_settings(self.guild_id)
+        await interaction.response.edit_message(
+            embed=bridge_config_embed(interaction.guild, settings),
+            view=BridgeConfigView(self.guild_id, settings),
+        )
+
+    async def select_announcement_channel(self, interaction):
+        selected = self.channel_select.values[0]
+        if (
+            not isinstance(selected, discord.TextChannel)
+            or str(selected.guild.id) != self.guild_id
+        ):
+            await interaction.response.send_message(
+                "Selecione um canal de texto deste servidor.",
+                ephemeral=True,
+            )
+            return
+
+        set_voice_announce_channel(self.guild_id, selected.id, interaction.user.id)
+        await start_existing_voice_rooms()
+        shared = await announce_active_voice_rooms(interaction.guild)
+        settings = get_bridge_settings(self.guild_id)
+        embed = bridge_config_embed(interaction.guild, settings)
+        embed.description = (
+            "Canal salvo. Links compartilhados agora nas calls ativas: "
+            f"**{shared}**. Novas calls serão anunciadas uma vez cada."
+        )
+        await interaction.response.edit_message(
+            embed=embed,
+            view=BridgeConfigView(self.guild_id, settings),
+        )
+
+
+@bot.tree.command(name="bridge_config", description="Abre o painel de configuração do VoidBridge.")
 async def bridge_config_slash(interaction: discord.Interaction):
     if not interaction.guild or str(interaction.guild.id) != DISCORD_GROUP_ID:
-        await interaction.response.send_message("Este comando só funciona no servidor conectado ao VoidBridge.", ephemeral=True)
+        await interaction.response.send_message(
+            "Este comando só funciona no servidor conectado ao VoidBridge.",
+            ephemeral=True,
+        )
         return
     if not interaction.user.guild_permissions.manage_guild:
-        await interaction.response.send_message("Você precisa da permissão Gerenciar Servidor.", ephemeral=True)
+        await interaction.response.send_message(
+            "Você precisa da permissão Gerenciar Servidor.",
+            ephemeral=True,
+        )
         return
+
+    settings = get_bridge_settings(interaction.guild.id)
     await interaction.response.send_message(
-        "**Configuração atual do VoidBridge**\n"
-        "• Mensagens: Discord ↔ GoLive\n"
-        "• Categorias e canais de texto/voz: sincronização automática\n"
-        "• Cargos: sincronização automática de nome, cor e permissões equivalentes\n"
-        "• Exclusões: não são replicadas automaticamente\n"
-        "• Áudio de chamadas: não disponível nesta integração\n"
-        "• Salas de transmissão GoLive: ainda dependem da integração oficial de salas; não vou simular uma chamada.",
+        embed=bridge_config_embed(interaction.guild, settings),
+        view=BridgeConfigView(interaction.guild.id, settings),
         ephemeral=True,
     )
 
