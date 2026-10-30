@@ -195,6 +195,20 @@ class GoLiveAPI:
     async def rename_channel(self, group_id, channel_id, name):
         return await self.request("PATCH", f"/groups/{quote(str(group_id), safe='')}/channels/{quote(str(channel_id), safe='')}", json={"name": name[:32]})
 
+    async def create_role(self, group_id, payload):
+        return await self.request(
+            "POST",
+            f"/groups/{quote(str(group_id), safe='')}/roles",
+            json=payload,
+        )
+
+    async def edit_role(self, group_id, role_id, payload):
+        return await self.request(
+            "PATCH",
+            f"/groups/{quote(str(group_id), safe='')}/roles/{quote(str(role_id), safe='')}",
+            json=payload,
+        )
+
     async def verify(self):
         data = await self.request("GET", "/auth/me")
         account = data.get("account", {})
@@ -428,8 +442,9 @@ async def golive_gateway_loop():
         await asyncio.sleep(8)
 
 
-# Sincroniza estrutura sem excluir nada. O SQLite mantém os pares de IDs.
+# Sincroniza estrutura sem excluir nada. O Supabase mantém os pares de IDs e snapshots.
 structure_lock = asyncio.Lock()
+structure_sync_pending = False
 
 def normalized_name(value):
     return " ".join(str(value or "").strip().lower().split())
@@ -440,8 +455,420 @@ def discord_channel_kind(channel):
     if isinstance(channel, discord.TextChannel): return "text"
     return None
 
+# Permissões que têm equivalência razoável nas duas plataformas.
+# Campos sem equivalente direto ficam fora do espelhamento.
+ROLE_PERMISSION_MAP = (
+    ("manage", "administrator", "administrator"),
+    ("manage", "manageGroup", "manage_guild"),
+    ("manage", "manageChannels", "manage_channels"),
+    ("manage", "manageRoles", "manage_roles"),
+    ("manage", "kickMembers", "kick_members"),
+    ("manage", "banMembers", "ban_members"),
+    ("manage", "muteMembers", "mute_members"),
+    ("manage", "moveMembers", "move_members"),
+    ("manage", "manageMessages", "manage_messages"),
+    ("manage", "createInvites", "create_instant_invite"),
+    ("manage", "manageWebhooks", "manage_webhooks"),
+    ("general", "viewChannel", "view_channel"),
+    ("general", "useExternalEmojis", "use_external_emojis"),
+    ("text", "sendMessages", "send_messages"),
+    ("text", "sendImages", "attach_files"),
+    ("text", "mentionEveryone", "mention_everyone"),
+    ("text", "addReactions", "add_reactions"),
+    ("voice", "connect", "connect"),
+    ("voice", "mic", "speak"),
+    ("voice", "screen", "stream"),
+)
+
+ROLE_METADATA_FIELDS = ("name", "color", "hoist", "mentionable")
+
+
+def role_color_from_discord(role):
+    value = int(role.colour.value)
+    return f"#{value:06x}" if value else None
+
+
+def normalize_role_color(value):
+    if value is None or value == "":
+        return None
+    try:
+        return f"#{int(str(value).strip().lstrip('#'), 16):06x}"
+    except (TypeError, ValueError):
+        return None
+
+
+def discord_role_snapshot(role):
+    snapshot = {
+        "name": str(role.name)[:32],
+        "color": role_color_from_discord(role),
+        "hoist": bool(role.hoist),
+        "mentionable": bool(role.mentionable),
+    }
+    for section, key, discord_key in ROLE_PERMISSION_MAP:
+        snapshot[f"perm:{section}.{key}"] = bool(
+            getattr(role.permissions, discord_key, False)
+        )
+    return snapshot
+
+
+def golive_role_snapshot(role):
+    snapshot = {
+        "name": str(role.get("name") or "")[:32],
+        "color": normalize_role_color(role.get("color")),
+        "hoist": bool(role.get("hoist", False)),
+        "mentionable": bool(role.get("mentionable", False)),
+    }
+    permissions = role.get("permissions") or {}
+    for section, key, _discord_key in ROLE_PERMISSION_MAP:
+        snapshot[f"perm:{section}.{key}"] = bool(
+            (permissions.get(section) or {}).get(key, False)
+        )
+    return snapshot
+
+
+def role_snapshot_json(snapshot):
+    return json.dumps(snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def parse_role_snapshot(value):
+    try:
+        parsed = json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(parsed, dict) or "name" not in parsed:
+        return None
+    return parsed
+
+
+def role_payload_for_golive(snapshot, fields=None):
+    fields = set(snapshot) if fields is None else set(fields)
+    payload = {}
+    for key in ROLE_METADATA_FIELDS:
+        if key in fields:
+            payload[key] = snapshot[key]
+    permissions = {}
+    for field in fields:
+        if not field.startswith("perm:"):
+            continue
+        section, key = field[5:].split(".", 1)
+        permissions.setdefault(section, {})[key] = bool(snapshot[field])
+    if permissions:
+        payload["permissions"] = permissions
+    return payload
+
+
+def role_edit_kwargs_for_discord(role, snapshot, fields=None):
+    fields = set(snapshot) if fields is None else set(fields)
+    kwargs = {}
+    if "name" in fields:
+        kwargs["name"] = snapshot["name"][:100]
+    if "color" in fields:
+        color = snapshot["color"]
+        kwargs["colour"] = (
+            discord.Colour.default()
+            if color is None
+            else discord.Colour(int(color.lstrip("#"), 16))
+        )
+    if "hoist" in fields:
+        kwargs["hoist"] = bool(snapshot["hoist"])
+    if "mentionable" in fields:
+        kwargs["mentionable"] = bool(snapshot["mentionable"])
+
+    permission_fields = [field for field in fields if field.startswith("perm:")]
+    if permission_fields:
+        permissions = discord.Permissions(int(role.permissions.value))
+        permission_lookup = {
+            f"perm:{section}.{key}": discord_key
+            for section, key, discord_key in ROLE_PERMISSION_MAP
+        }
+        for field in permission_fields:
+            discord_key = permission_lookup.get(field)
+            if discord_key:
+                setattr(permissions, discord_key, bool(snapshot[field]))
+        kwargs["permissions"] = permissions
+    return kwargs
+
+
+def golive_writable_role_permission_fields(bot_permissions):
+    manage = bot_permissions.get("manage") or {}
+    administrator = bool(manage.get("administrator"))
+    fields = set()
+    for section, key, _discord_key in ROLE_PERMISSION_MAP:
+        if administrator or bool((bot_permissions.get(section) or {}).get(key, False)):
+            fields.add(f"perm:{section}.{key}")
+    return fields
+
+
+async def sync_roles(guild, remote):
+    group = remote.get("group") or {}
+    golive_roles = list(group.get("roles") or [])
+    discord_roles = [
+        role for role in guild.roles
+        if not role.is_default() and not role.managed
+    ]
+    bot_permissions = (remote.get("me") or {}).get("permissions") or {}
+    can_manage_golive_roles = bool(
+        (bot_permissions.get("manage") or {}).get("manageRoles")
+        or (bot_permissions.get("manage") or {}).get("administrator")
+    )
+    writable_permission_fields = golive_writable_role_permission_fields(bot_permissions)
+    rows = get_structure_maps("role")
+    mapped_discord_ids = {str(row[0]) for row in rows}
+    mapped_golive_ids = {str(row[1]) for row in rows}
+    discord_by_id = {str(role.id): role for role in discord_roles}
+    golive_by_id = {
+        str(role.get("id")): role for role in golive_roles
+        if role.get("id") and not role.get("managedBy") and not role.get("system")
+    }
+
+    async def link_existing(discord_role, golive_role):
+        discord_snapshot = discord_role_snapshot(discord_role)
+        golive_snapshot = golive_role_snapshot(golive_role)
+        # No primeiro vínculo, o Discord é a origem preferencial.
+        fields = set(ROLE_METADATA_FIELDS) | writable_permission_fields
+        if can_manage_golive_roles:
+            try:
+                response = await golive_api.edit_role(
+                    GOLIVE_GROUP_ID,
+                    golive_role["id"],
+                    role_payload_for_golive(discord_snapshot, fields),
+                )
+                golive_role = response.get("role") or {
+                    **golive_role,
+                    **role_payload_for_golive(discord_snapshot, fields),
+                }
+                golive_snapshot = golive_role_snapshot(golive_role)
+            except Exception:
+                log.exception(
+                    "Não consegui fazer a sincronização inicial do cargo Discord %s para o GoLive.",
+                    discord_role.name,
+                )
+        save_structure_map(
+            "role", discord_role.id, golive_role["id"],
+            role_snapshot_json(golive_snapshot),
+        )
+        mapped_discord_ids.add(str(discord_role.id))
+        mapped_golive_ids.add(str(golive_role["id"]))
+        return golive_role
+
+    # Primeiro, atualiza pares já conhecidos. O JSON em last_name guarda
+    # o último estado sincronizado, sem exigir uma nova tabela no Supabase.
+    for discord_id, golive_id, saved_value in rows:
+        discord_id, golive_id = str(discord_id), str(golive_id)
+        discord_role = discord_by_id.get(discord_id)
+        golive_role = golive_by_id.get(golive_id)
+        if discord_role is None or golive_role is None:
+            log.warning(
+                "Cargo mapeado ausente em um dos lados (Discord %s / GoLive %s). "
+                "Não vou recriá-lo nem apagá-lo automaticamente.",
+                discord_id, golive_id,
+            )
+            continue
+
+        previous = parse_role_snapshot(saved_value)
+        discord_snapshot = discord_role_snapshot(discord_role)
+        golive_snapshot = golive_role_snapshot(golive_role)
+        if previous is None:
+            await link_existing(discord_role, golive_role)
+            continue
+
+        discord_changes = {
+            key for key in set(previous) | set(discord_snapshot)
+            if previous.get(key) != discord_snapshot.get(key)
+        }
+        golive_changes = {
+            key for key in set(previous) | set(golive_snapshot)
+            if previous.get(key) != golive_snapshot.get(key)
+        }
+        conflicts = {
+            key for key in discord_changes & golive_changes
+            if discord_snapshot.get(key) != golive_snapshot.get(key)
+        }
+
+        # Mudanças diferentes podem ser mescladas. Só há conflito quando os
+        # dois lados alteraram o mesmo campo para valores diferentes.
+        discord_to_golive = {
+            key for key in discord_changes
+            if key not in conflicts
+            and (key not in golive_changes or discord_snapshot.get(key) == golive_snapshot.get(key))
+        }
+        golive_to_discord = {
+            key for key in golive_changes
+            if key not in conflicts
+            and (key not in discord_changes or discord_snapshot.get(key) == golive_snapshot.get(key))
+        }
+
+        if not can_manage_golive_roles:
+            discord_to_golive = set()
+        else:
+            discord_to_golive = {
+                key for key in discord_to_golive
+                if not key.startswith("perm:") or key in writable_permission_fields
+            }
+
+        if conflicts:
+            log.warning(
+                "Conflito no cargo '%s' (Discord ↔ GoLive), campos: %s. "
+                "Mantive os dois valores sem sobrescrever.",
+                discord_role.name, ", ".join(sorted(conflicts)),
+            )
+
+        if discord_to_golive:
+            try:
+                payload = role_payload_for_golive(discord_snapshot, discord_to_golive)
+                response = await golive_api.edit_role(
+                    GOLIVE_GROUP_ID, golive_id, payload
+                )
+                golive_role = response.get("role") or {**golive_role, **payload}
+                golive_snapshot = golive_role_snapshot(golive_role)
+            except Exception:
+                log.exception(
+                    "Falha ao aplicar alterações do cargo Discord '%s' no GoLive.",
+                    discord_role.name,
+                )
+
+        if golive_to_discord:
+            try:
+                kwargs = role_edit_kwargs_for_discord(
+                    discord_role, golive_snapshot, golive_to_discord
+                )
+                if kwargs:
+                    discord_role = await discord_role.edit(
+                        **kwargs, reason="VoidBridge: sincronizar cargo GoLive"
+                    )
+                    discord_snapshot = discord_role_snapshot(discord_role)
+            except Exception:
+                log.exception(
+                    "Falha ao aplicar alterações do cargo GoLive '%s' no Discord.",
+                    golive_role.get("name", golive_id),
+                )
+
+        # Avança o ponto de comparação apenas para campos convergentes.
+        # Campos conflitantes ou cuja escrita falhou continuam pendentes.
+        next_snapshot = {}
+        for key in set(previous) | set(discord_snapshot) | set(golive_snapshot):
+            if key in conflicts:
+                next_snapshot[key] = previous.get(key)
+            elif discord_snapshot.get(key) == golive_snapshot.get(key):
+                next_snapshot[key] = discord_snapshot.get(key)
+            else:
+                next_snapshot[key] = previous.get(key)
+        save_structure_map(
+            "role", discord_id, golive_id, role_snapshot_json(next_snapshot)
+        )
+
+    # Cargos existentes no Discord: associa por nome único ou cria no GoLive.
+    eligible_golive = [
+        role for role in golive_roles
+        if role.get("id") and not role.get("managedBy") and not role.get("system")
+    ]
+    for discord_role in discord_roles:
+        discord_id = str(discord_role.id)
+        if discord_id in mapped_discord_ids:
+            continue
+        matches = [
+            role for role in eligible_golive
+            if str(role.get("id")) not in mapped_golive_ids
+            and normalized_name(role.get("name")) == normalized_name(discord_role.name)
+        ]
+        if len(matches) == 1:
+            await link_existing(discord_role, matches[0])
+            continue
+        if len(matches) > 1:
+            log.warning(
+                "Há mais de um cargo GoLive chamado '%s'; não associei automaticamente.",
+                discord_role.name,
+            )
+            continue
+        if not can_manage_golive_roles:
+            log.warning(
+                "O bot GoLive não tem manageRoles; não pode criar o cargo '%s'.",
+                discord_role.name,
+            )
+            continue
+        snapshot = discord_role_snapshot(discord_role)
+        fields = set(ROLE_METADATA_FIELDS) | writable_permission_fields
+        payload = role_payload_for_golive(snapshot, fields)
+        try:
+            response = await golive_api.create_role(GOLIVE_GROUP_ID, payload)
+            created = response.get("role") or {}
+            if not created.get("id"):
+                log.error("GoLive não retornou o ID do cargo criado '%s'.", discord_role.name)
+                continue
+            golive_roles.append(created)
+            golive_by_id[str(created["id"])] = created
+            mapped_discord_ids.add(discord_id)
+            mapped_golive_ids.add(str(created["id"]))
+            save_structure_map(
+                "role", discord_role.id, created["id"],
+                role_snapshot_json(golive_role_snapshot(created)),
+            )
+            await asyncio.sleep(2.05)
+        except Exception:
+            log.exception("Não consegui criar no GoLive o cargo Discord '%s'.", discord_role.name)
+
+    # Cargos criados no GoLive: cria o equivalente no Discord.
+    for golive_role in eligible_golive:
+        golive_id = str(golive_role.get("id"))
+        if golive_id in mapped_golive_ids:
+            continue
+        matches = [
+            role for role in discord_roles
+            if str(role.id) not in mapped_discord_ids
+            and normalized_name(role.name) == normalized_name(golive_role.get("name"))
+        ]
+        if len(matches) > 1:
+            log.warning(
+                "Há mais de um cargo Discord chamado '%s'; não associei automaticamente.",
+                golive_role.get("name"),
+            )
+            continue
+        snapshot = golive_role_snapshot(golive_role)
+        try:
+            if matches:
+                discord_role = matches[0]
+                await link_existing(discord_role, golive_role)
+            else:
+                kwargs = role_edit_kwargs_for_discord(
+                    type("RolePermissionProxy", (), {
+                        "permissions": discord.Permissions.none()
+                    })(),
+                    snapshot,
+                )
+                discord_role = await guild.create_role(
+                    name=snapshot["name"][:100] or "Cargo GoLive",
+                    permissions=kwargs.get("permissions", discord.Permissions.none()),
+                    colour=(
+                        discord.Colour.default()
+                        if snapshot["color"] is None
+                        else discord.Colour(int(snapshot["color"].lstrip("#"), 16))
+                    ),
+                    hoist=snapshot["hoist"],
+                    mentionable=snapshot["mentionable"],
+                    reason="VoidBridge: criar cargo vindo do GoLive",
+                )
+                discord_roles.append(discord_role)
+                discord_by_id[str(discord_role.id)] = discord_role
+                mapped_discord_ids.add(str(discord_role.id))
+                mapped_golive_ids.add(golive_id)
+                save_structure_map(
+                    "role", discord_role.id, golive_id,
+                    role_snapshot_json(discord_role_snapshot(discord_role)),
+                )
+        except Exception:
+            log.exception(
+                "Não consegui criar no Discord o cargo GoLive '%s'.",
+                golive_role.get("name", golive_id),
+            )
+
+
 async def sync_structure():
-    if structure_lock.locked() or golive_api is None: return
+    global structure_sync_pending
+    if golive_api is None:
+        return
+    if structure_lock.locked():
+        structure_sync_pending = True
+        return
     async with structure_lock:
         try:
             guild = bot.get_guild(int(DISCORD_GROUP_ID))
@@ -532,13 +959,20 @@ async def sync_structure():
                         dc = await guild.create_text_channel(name, category=category, reason="VoidBridge: sala GoLive")
                     supported.append(dc)
                 save_structure_map("channel", dc.id, gl["id"], dc.name)
-            log.info("Estrutura Discord ↔ GoLive sincronizada.")
+            await sync_roles(guild, remote)
+            log.info("Estrutura e cargos Discord ↔ GoLive sincronizados.")
         except discord.Forbidden:
             log.exception("Sem permissão Discord para criar ou renomear canais.")
         except GoLiveAPIError as exc:
             log.error("Erro GoLive HTTP %s: %s", exc.status, exc.data)
         except Exception:
             log.exception("Falha ao sincronizar estrutura.")
+        finally:
+            if structure_sync_pending:
+                structure_sync_pending = False
+                asyncio.get_running_loop().call_soon(
+                    lambda: asyncio.create_task(sync_structure())
+                )
 
 @bot.event
 async def on_ready():
@@ -562,6 +996,22 @@ async def on_guild_channel_create(channel):
 @bot.event
 async def on_guild_channel_update(before, after):
     if str(after.guild.id) == DISCORD_GROUP_ID: await sync_structure()
+
+
+@bot.event
+async def on_guild_role_create(role):
+    if str(role.guild.id) == DISCORD_GROUP_ID:
+        await sync_structure()
+
+@bot.event
+async def on_guild_role_update(before, after):
+    if str(after.guild.id) == DISCORD_GROUP_ID:
+        await sync_structure()
+
+@bot.event
+async def on_guild_role_delete(role):
+    if str(role.guild.id) == DISCORD_GROUP_ID:
+        await sync_structure()
 
 @bot.event
 async def on_message(message):
