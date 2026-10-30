@@ -44,7 +44,10 @@ logging.basicConfig(
 )
 log = logging.getLogger("VoidBridge")
 
-BRIDGES = CONFIG.get("bridges", [])
+GOLIVE_GROUP_ID = str(CONFIG.get("golive_group_id", "")).strip()
+DISCORD_GROUP_ID = str(CONFIG.get("discord_group_id", "")).strip()
+if not GOLIVE_GROUP_ID or not DISCORD_GROUP_ID:
+    raise SystemExit("Preencha golive_group_id e discord_group_id no config.json")
 MAX_UPLOAD = int(CONFIG.get("max_upload_mb", 20)) * 1024 * 1024
 ANNOUNCE_VOICE = bool(CONFIG.get("announce_discord_voice", False))
 
@@ -63,6 +66,11 @@ def db():
             golive_group_id TEXT,
             golive_channel_id TEXT,
             PRIMARY KEY(source_platform, source_id)
+        )""")
+        con.execute("""CREATE TABLE IF NOT EXISTS structure_map (
+            entity_type TEXT NOT NULL, discord_id TEXT NOT NULL, golive_id TEXT NOT NULL,
+            last_name TEXT NOT NULL, PRIMARY KEY(entity_type, discord_id),
+            UNIQUE(entity_type, golive_id)
         )""")
         yield con
         con.commit()
@@ -100,13 +108,36 @@ def remove_map(source_platform, source_id):
             (source_platform, str(source_id)),
         )
 
+def get_structure_maps(kind):
+    with db() as con:
+        return con.execute("SELECT discord_id, golive_id, last_name FROM structure_map WHERE entity_type=?", (kind,)).fetchall()
+
+def get_structure_map_by_discord(kind, ident):
+    with db() as con:
+        return con.execute("SELECT discord_id, golive_id, last_name FROM structure_map WHERE entity_type=? AND discord_id=?", (kind, str(ident))).fetchone()
+
+def get_structure_map_by_golive(kind, ident):
+    with db() as con:
+        return con.execute("SELECT discord_id, golive_id, last_name FROM structure_map WHERE entity_type=? AND golive_id=?", (kind, str(ident))).fetchone()
+
+def save_structure_map(kind, discord_id, golive_id, name):
+    with db() as con:
+        con.execute("""INSERT INTO structure_map VALUES (?, ?, ?, ?)
+            ON CONFLICT(entity_type, discord_id) DO UPDATE SET
+            golive_id=excluded.golive_id, last_name=excluded.last_name""",
+            (kind, str(discord_id), str(golive_id), str(name)))
+
 def bridge_for_discord(channel_id):
-    return next((b for b in BRIDGES if str(b.get("discord_channel_id")) == str(channel_id)), None)
+    row = get_structure_map_by_discord("channel", channel_id)
+    return {"discord_channel_id": str(channel_id), "golive_group_id": GOLIVE_GROUP_ID,
+            "golive_channel_id": row[1]} if row else None
 
 def bridge_for_golive(group_id, channel_id):
-    return next((b for b in BRIDGES
-                 if str(b.get("golive_group_id")) == str(group_id)
-                 and str(b.get("golive_channel_id")) == str(channel_id)), None)
+    if str(group_id) != GOLIVE_GROUP_ID:
+        return None
+    row = get_structure_map_by_golive("channel", channel_id)
+    return {"discord_channel_id": row[0], "golive_group_id": GOLIVE_GROUP_ID,
+            "golive_channel_id": str(channel_id)} if row else None
 
 def clean_text(text, limit=5900):
     text = (text or "").strip()
@@ -136,6 +167,22 @@ class GoLiveAPI:
             if response.status >= 400:
                 raise GoLiveAPIError(response.status, data)
             return data
+
+    async def get_group(self, group_id):
+        return await self.request("GET", f"/groups/{quote(str(group_id), safe='')}")
+
+    async def create_category(self, group_id, name):
+        return await self.request("POST", f"/groups/{quote(str(group_id), safe='')}/categories", json={"name": name[:32]})
+
+    async def rename_category(self, group_id, category_id, name):
+        return await self.request("PATCH", f"/groups/{quote(str(group_id), safe='')}/categories/{quote(str(category_id), safe='')}", json={"name": name[:32]})
+
+    async def create_channel(self, group_id, name, kind, category_id=None):
+        return await self.request("POST", f"/groups/{quote(str(group_id), safe='')}/channels",
+                                  json={"name": name[:32], "kind": kind, "categoryId": category_id})
+
+    async def rename_channel(self, group_id, channel_id, name):
+        return await self.request("PATCH", f"/groups/{quote(str(group_id), safe='')}/channels/{quote(str(channel_id), safe='')}", json={"name": name[:32]})
 
     async def verify(self):
         data = await self.request("GET", "/auth/me")
@@ -256,6 +303,10 @@ async def handle_golive_event(event):
         log.error("Bot GoLive banido: %s", event)
         return
 
+    if kind == "group-updated" and str(event.get("groupId")) == GOLIVE_GROUP_ID:
+        await sync_structure()
+        return
+
     if kind == "group-message":
         message = event.get("message", {})
         author = event.get("author", {})
@@ -318,14 +369,6 @@ async def handle_golive_event(event):
                     event.get("groupId"), event.get("reason"))
         return
 
-    if kind == "group-voice" and CONFIG.get("announce_golive_voice", False):
-        group_id = event.get("groupId")
-        for bridge in BRIDGES:
-            if str(bridge.get("golive_group_id")) == str(group_id):
-                await send_discord(
-                    bridge["discord_channel_id"],
-                    "[GoLive] A atividade de voz da sala foi atualizada."
-                )
 
 async def golive_gateway_loop():
     global golive_ready
@@ -359,12 +402,134 @@ async def golive_gateway_loop():
             golive_ready.clear()
         await asyncio.sleep(8)
 
+
+# Sincroniza estrutura sem excluir nada. O SQLite mantém os pares de IDs.
+structure_lock = asyncio.Lock()
+
+def normalized_name(value):
+    return " ".join(str(value or "").strip().lower().split())
+
+def discord_channel_kind(channel):
+    if isinstance(channel, discord.CategoryChannel): return "category"
+    if isinstance(channel, discord.VoiceChannel): return "voice"
+    if isinstance(channel, discord.TextChannel): return "text"
+    return None
+
+async def sync_structure():
+    if structure_lock.locked() or golive_api is None: return
+    async with structure_lock:
+        try:
+            guild = bot.get_guild(int(DISCORD_GROUP_ID))
+            if guild is None: guild = await bot.fetch_guild(int(DISCORD_GROUP_ID))
+            remote = await golive_api.get_group(GOLIVE_GROUP_ID)
+            gl_cats = list(remote.get("categories", []) or [])
+            gl_chans = list(remote.get("channels", []) or [])
+            dc_chans = list(guild.channels)
+
+            # Categorias existentes no Discord: vincula por ID salvo ou nome.
+            known = {r[0]: r for r in get_structure_maps("category")}
+            used = {r[1] for r in known.values()}
+            for dc in [x for x in dc_chans if isinstance(x, discord.CategoryChannel)]:
+                row = known.get(str(dc.id))
+                gl = next((x for x in gl_cats if row and str(x.get("id")) == row[1]), None)
+                if gl is None:
+                    gl = next((x for x in gl_cats if str(x.get("id")) not in used and normalized_name(x.get("name")) == normalized_name(dc.name)), None)
+                if gl is None:
+                    result = await golive_api.create_category(GOLIVE_GROUP_ID, dc.name)
+                    gl = result.get("category", {})
+                    if gl.get("id"): gl_cats.append(gl)
+                if not gl or not gl.get("id"): continue
+                previous = row[2] if row else dc.name
+                gn, dn = str(gl.get("name") or ""), dc.name
+                if row and dn != previous and gn == previous:
+                    await golive_api.rename_category(GOLIVE_GROUP_ID, gl["id"], dn); gn = dn
+                elif row and gn != previous and dn == previous:
+                    await dc.edit(name=gn, reason="VoidBridge: sincronizar categoria"); dn = gn
+                elif row and gn != dn and dn != previous and gn != previous:
+                    await golive_api.rename_category(GOLIVE_GROUP_ID, gl["id"], dn); gn = dn
+                save_structure_map("category", dc.id, gl["id"], dn)
+                used.add(str(gl["id"]))
+
+            # Categorias criadas no GoLive.
+            mapped = {r[1] for r in get_structure_maps("category")}
+            for gl in gl_cats:
+                if str(gl.get("id")) in mapped: continue
+                dc = next((x for x in dc_chans if isinstance(x, discord.CategoryChannel) and normalized_name(x.name) == normalized_name(gl.get("name"))), None)
+                if dc is None:
+                    dc = await guild.create_category(str(gl.get("name") or "categoria")[:100], reason="VoidBridge: categoria GoLive")
+                    dc_chans.append(dc)
+                save_structure_map("category", dc.id, gl["id"], dc.name)
+
+            cat_rows = get_structure_maps("category")
+            gl_to_dc_cat = {r[1]: guild.get_channel(int(r[0])) for r in cat_rows}
+            dc_to_gl_cat = {int(r[0]): r[1] for r in cat_rows}
+
+            # Canais Discord -> GoLive.
+            known = {r[0]: r for r in get_structure_maps("channel")}
+            used = {r[1] for r in known.values()}
+            supported = [x for x in dc_chans if discord_channel_kind(x) in ("text", "voice")]
+            for dc in supported:
+                kind = discord_channel_kind(dc)
+                row = known.get(str(dc.id))
+                gl = next((x for x in gl_chans if row and str(x.get("id")) == row[1]), None)
+                if gl is None:
+                    gl = next((x for x in gl_chans if str(x.get("id")) not in used and x.get("kind", "text") == kind and normalized_name(x.get("name")) == normalized_name(dc.name)), None)
+                if gl is None:
+                    parent = getattr(dc, "category_id", None)
+                    result = await golive_api.create_channel(GOLIVE_GROUP_ID, dc.name, kind, dc_to_gl_cat.get(parent) if parent else None)
+                    gl = result.get("channel", {})
+                    if gl.get("id"): gl_chans.append(gl)
+                if not gl or not gl.get("id"): continue
+                previous = row[2] if row else dc.name
+                gn, dn = str(gl.get("name") or ""), dc.name
+                if row and dn != previous and gn == previous:
+                    await golive_api.rename_channel(GOLIVE_GROUP_ID, gl["id"], dn); gn = dn
+                elif row and gn != previous and dn == previous:
+                    await dc.edit(name=gn, reason="VoidBridge: sincronizar sala"); dn = gn
+                elif row and gn != dn and dn != previous and gn != previous:
+                    await golive_api.rename_channel(GOLIVE_GROUP_ID, gl["id"], dn); gn = dn
+                save_structure_map("channel", dc.id, gl["id"], dn)
+                used.add(str(gl["id"]))
+
+            # Canais GoLive -> Discord.
+            mapped = {r[1] for r in get_structure_maps("channel")}
+            for gl in gl_chans:
+                if str(gl.get("id")) in mapped: continue
+                kind = gl.get("kind", "text")
+                if kind not in ("text", "voice"): continue
+                dc = next((x for x in supported if discord_channel_kind(x) == kind and normalized_name(x.name) == normalized_name(gl.get("name"))), None)
+                if dc is None:
+                    category = gl_to_dc_cat.get(str(gl.get("categoryId"))) if gl.get("categoryId") else None
+                    name = str(gl.get("name") or "sala")[:100]
+                    if kind == "voice":
+                        dc = await guild.create_voice_channel(name, category=category, reason="VoidBridge: sala GoLive")
+                    else:
+                        dc = await guild.create_text_channel(name, category=category, reason="VoidBridge: sala GoLive")
+                    supported.append(dc)
+                save_structure_map("channel", dc.id, gl["id"], dc.name)
+            log.info("Estrutura Discord ↔ GoLive sincronizada.")
+        except discord.Forbidden:
+            log.exception("Sem permissão Discord para criar ou renomear canais.")
+        except GoLiveAPIError as exc:
+            log.error("Erro GoLive HTTP %s: %s", exc.status, exc.data)
+        except Exception:
+            log.exception("Falha ao sincronizar estrutura.")
+
 @bot.event
 async def on_ready():
     log.info("Discord conectado como %s", bot.user)
     if not getattr(bot, "_golive_started", False):
         bot._golive_started = True
         asyncio.create_task(golive_gateway_loop())
+        asyncio.create_task(sync_structure())
+
+@bot.event
+async def on_guild_channel_create(channel):
+    if str(channel.guild.id) == DISCORD_GROUP_ID: await sync_structure()
+
+@bot.event
+async def on_guild_channel_update(before, after):
+    if str(after.guild.id) == DISCORD_GROUP_ID: await sync_structure()
 
 @bot.event
 async def on_message(message):
@@ -489,35 +654,14 @@ async def on_message_edit(before, after):
 
 @bot.event
 async def on_voice_state_update(member, before, after):
-    if not ANNOUNCE_VOICE or member.bot:
-        return
-    if before.channel == after.channel:
-        return
-    for bridge in BRIDGES:
-        channel_id = bridge["discord_channel_id"]
-        discord_channel = bot.get_channel(int(channel_id))
-        if discord_channel is None or not hasattr(discord_channel, "guild"):
-            continue
-        if discord_channel.guild.id != member.guild.id:
-            continue
-        if before.channel is None and after.channel:
-            notice = f"[Discord] {member.display_name} entrou na chamada **{after.channel.name}**."
-        elif after.channel is None and before.channel:
-            notice = f"[Discord] {member.display_name} saiu da chamada **{before.channel.name}**."
-        else:
-            notice = f"[Discord] {member.display_name} mudou de chamada para **{after.channel.name}**."
-        try:
-            await golive_api.send_message(
-                bridge["golive_group_id"], bridge["golive_channel_id"], notice
-            )
-        except Exception:
-            log.exception("Falha ao publicar aviso de voz")
+    # Só sincronizamos a existência/nome dos canais, nunca o áudio.
+    return
 
 @bot.command(name="bridge")
 @commands.has_permissions(manage_guild=True)
 async def bridge_status(ctx):
     state = "conectado" if golive_ready.is_set() else "reconectando/desconectado"
-    await ctx.reply(f"VoidBridge ativo. GoLive: **{state}**. Pontes configuradas: **{len(BRIDGES)}**.")
+    await ctx.reply(f"VoidBridge ativo. GoLive: **{state}**. Discord: **{DISCORD_GROUP_ID}** | GoLive: **{GOLIVE_GROUP_ID}**.")
 
 @bridge_status.error
 async def bridge_status_error(ctx, error):
