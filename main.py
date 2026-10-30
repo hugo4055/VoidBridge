@@ -430,11 +430,34 @@ async def on_message_edit(before, after):
         return
     # A API REST atual oferece PATCH para editar mensagens do próprio bot.
     _, golive_message_id, _, group_id, channel_id = mapped
+    edited_text = (
+        f"{CONFIG.get('discord_prefix', '[Discord]')} "
+        f"{after.author.display_name}: {clean_text(after.clean_content)}"
+    )
     try:
         await golive_api.edit_message(
-            group_id, channel_id, golive_message_id,
-            f"{CONFIG.get('discord_prefix', '[Discord]')} {after.author.display_name}: {clean_text(after.clean_content)}"
+            group_id, channel_id, golive_message_id, edited_text
         )
+    except RuntimeError as exc:
+        # Algumas páginas da documentação do GoLive divergem sobre PATCH.
+        # Se a instância ainda não oferecer essa rota, usa o fallback documentado.
+        if "GoLive HTTP 404" not in str(exc) and "GoLive HTTP 405" not in str(exc):
+            log.exception("Falha ao sincronizar edição Discord → GoLive")
+            return
+        try:
+            await golive_api.delete_message(group_id, channel_id, golive_message_id)
+            result = await golive_api.send_message(
+                group_id, channel_id, edited_text
+            )
+            new_message = result.get("message", {})
+            if new_message.get("id"):
+                save_map(
+                    "discord", after.id, "golive", new_message["id"],
+                    discord_channel_id=after.channel.id,
+                    group_id=group_id, channel_id=channel_id
+                )
+        except Exception:
+            log.exception("Falha no fallback de edição Discord → GoLive")
     except Exception:
         log.exception("Falha ao sincronizar edição Discord → GoLive")
 
