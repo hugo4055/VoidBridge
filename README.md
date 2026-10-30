@@ -12,7 +12,7 @@ Sincroniza a estrutura de um servidor Discord inteiro com um grupo GoLive usando
 - Anexos e imagens dentro dos limites das plataformas.
 - Edições e exclusões de mensagens quando há mapeamento.
 - Mapeamento persistente em SQLite para reduzir duplicações.
-- Vínculo individual Discord ↔ GoLive por OAuth2 (`/vincular`) e consulta (`/vinculo`); o callback usa `state` e PKCE e guarda apenas os IDs das contas, sem persistir tokens OAuth.
+- Vínculo individual Discord ↔ GoLive por código de uso único: `/vincular` no Discord envia o código por mensagem privada; depois, no GoLive, o usuário digita `/vincular XXX-XXX` em uma sala do grupo conectado. `/vinculo` consulta a associação.
 
 ## Proteção dos canais existentes
 
@@ -29,7 +29,7 @@ Edite config.json (o repositório já contém os IDs informados):
 }
 ```
 
-Tokens continuam no arquivo `.env`: `DISCORD_TOKEN` e `GOLIVE_TOKEN`. Para o vínculo de contas, configure também `GOLIVE_OAUTH_CLIENT_ID`, `GOLIVE_OAUTH_CLIENT_SECRET` e `GOLIVE_OAUTH_REDIRECT_URI` no ambiente do servidor. O callback padrão é `https://voidbridge.onrender.com/oauth/golive/callback`.
+Tokens continuam no arquivo `.env`: `DISCORD_TOKEN` e `GOLIVE_TOKEN`. Não é necessário criar aplicativo OAuth nem configurar Client ID, Client Secret ou URL de callback.
 
 ## Instalação no Windows
 
@@ -47,7 +47,7 @@ Tokens continuam no arquivo `.env`: `DISCORD_TOKEN` e `GOLIVE_TOKEN`. Para o ví
 
 ## Limitações
 
-Sem áudio, câmera, compartilhamento de tela ou chamadas. A sincronização de cargos e permissões ainda não está incluída; o OAuth apenas associa as identidades de forma segura. Não espelha presença, reações ou threads. Canais de fórum, palco e outros tipos especiais do Discord não são copiados. Mensagens antigas não são importadas; a sincronização começa quando o bot está online. O computador que executa o bot precisa permanecer ligado.
+Sem áudio, câmera, compartilhamento de tela ou chamadas. A sincronização de cargos e permissões ainda não está incluída; o código de vinculação associa as identidades sem guardar tokens de usuário. Não espelha presença, reações ou threads. Canais de fórum, palco e outros tipos especiais do Discord não são copiados. Mensagens antigas não são importadas; a sincronização começa quando o bot está online. O computador que executa o bot precisa permanecer ligado.
 
 ## Segurança
 
