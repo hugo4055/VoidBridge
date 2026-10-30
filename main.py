@@ -553,19 +553,21 @@ def parse_role_snapshot(value):
     return parsed
 
 
-def role_payload_for_golive(snapshot, fields=None):
+def role_payload_for_golive(snapshot, fields=None, current_role=None):
     fields = set(snapshot) if fields is None else set(fields)
     payload = {}
     for key in ROLE_METADATA_FIELDS:
         if key in fields:
             payload[key] = snapshot[key]
-    permissions = {}
-    for field in fields:
-        if not field.startswith("perm:"):
-            continue
-        section, key = field[5:].split(".", 1)
-        permissions.setdefault(section, {})[key] = bool(snapshot[field])
-    if permissions:
+    permission_fields = [field for field in fields if field.startswith("perm:")]
+    if permission_fields:
+        permissions = {
+            section: dict(values or {})
+            for section, values in ((current_role or {}).get("permissions") or {}).items()
+        }
+        for field in permission_fields:
+            section, key = field[5:].split(".", 1)
+            permissions.setdefault(section, {})[key] = bool(snapshot[field])
         payload["permissions"] = permissions
     return payload
 
@@ -644,9 +646,13 @@ async def sync_roles(guild, remote):
                 response = await golive_api.edit_role(
                     GOLIVE_GROUP_ID,
                     golive_role["id"],
-                    role_payload_for_golive(discord_snapshot, fields),
+                    role_payload_for_golive(
+                        discord_snapshot, fields, current_role=golive_role
+                    ),
                 )
-                initial_payload = role_payload_for_golive(discord_snapshot, fields)
+                initial_payload = role_payload_for_golive(
+                    discord_snapshot, fields, current_role=golive_role
+                )
                 golive_role = response.get("role") or merge_golive_role(
                     golive_role, initial_payload
                 )
@@ -726,7 +732,9 @@ async def sync_roles(guild, remote):
 
         if discord_to_golive:
             try:
-                payload = role_payload_for_golive(discord_snapshot, discord_to_golive)
+                payload = role_payload_for_golive(
+                    discord_snapshot, discord_to_golive, current_role=golive_role
+                )
                 response = await golive_api.edit_role(
                     GOLIVE_GROUP_ID, golive_id, payload
                 )
