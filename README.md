@@ -10,7 +10,9 @@ Ponte de mensagens entre canais de texto do Discord e salas de texto de grupos d
 - Atualiza mensagens editadas nos dois sentidos (Discord ↔ GoLive).
 - Sincroniza edições nos dois sentidos usando a rota PATCH de mensagens do GoLive.
 - Registra entrada/saída de voz do Discord como aviso de texto opcional.
-- Reconecta ao Gateway do GoLive automaticamente.
+- Reconecta ao Gateway do GoLive automaticamente, respeitando erros temporários (`retryable`) e parando em recusas definitivas.
+- Repete a verificação inicial da API quando o GoLive informa indisponibilidade temporária (`503` com `retryable: true`).
+- Fecha corretamente as conexões SQLite após cada operação, evitando acúmulo de conexões abertas.
 - Usa SQLite para mapear mensagens e evitar loops.
 - Suporta vários pares de canais.
 
