@@ -1384,7 +1384,7 @@ async def main():
         app.router.add_get("/health", health_check)
         runner = web.AppRunner(app)
         await runner.setup()
-        site = web.TCPSite(app_runner=runner, host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
+        site = web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", "10000")))
         await site.start()
         log.info("Health check disponível em /health.")
 
