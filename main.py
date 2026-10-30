@@ -63,7 +63,6 @@ DISCORD_GROUP_ID = str(CONFIG.get("discord_group_id", "")).strip()
 if not GOLIVE_GROUP_ID or not DISCORD_GROUP_ID:
     raise SystemExit("Preencha golive_group_id e discord_group_id no config.json")
 MAX_UPLOAD = int(CONFIG.get("max_upload_mb", 20)) * 1024 * 1024
-ANNOUNCE_VOICE = bool(CONFIG.get("announce_discord_voice", False))
 
 # Eleição de líder compartilhada entre Render (primary) e Replit (backup).
 INSTANCE_ROLE = os.getenv("INSTANCE_ROLE", "primary").strip().lower()
@@ -1288,7 +1287,8 @@ async def announce_voice_room(voice_channel_id, handle):
         return False
 
     row = get_structure_map_by_discord("voice_room", voice_channel_id)
-    if row and row[2] == "announced":
+    announcement_marker = f"announced:{announcement_id}"
+    if row and row[2] == announcement_marker:
         return True
 
     announcement_channel = bot.get_channel(int(announcement_id))
@@ -1311,7 +1311,7 @@ async def announce_voice_room(voice_channel_id, handle):
             f"🔗 Sala GoLive para a call **{voice_channel.name}**: {room_url(handle)}",
             allowed_mentions=discord.AllowedMentions.none(),
         )
-        save_structure_map("voice_room", voice_channel.id, handle, "announced")
+        save_structure_map("voice_room", voice_channel.id, handle, announcement_marker)
         log.info("Link da sala GoLive compartilhado para o canal de voz %s.", voice_channel.id)
         return True
     except discord.Forbidden:
@@ -1332,7 +1332,8 @@ async def announce_active_voice_rooms(guild):
             continue
         row = get_structure_map_by_discord("voice_room", voice_channel.id)
         if row:
-            if row[2] != "announced" and await announce_voice_room(voice_channel.id, row[1]):
+            expected_marker = f"announced:{settings.get('voice_announce_channel_id')}"
+            if row[2] != expected_marker and await announce_voice_room(voice_channel.id, row[1]):
                 shared += 1
         else:
             await ensure_voice_room(voice_channel)
@@ -1347,7 +1348,9 @@ async def _voice_room_worker(channel_id, guild_id, stop_event):
         handle = str(row[1])
     else:
         save_structure_map("voice_room", channel_id, handle, "pending")
-    announced = bool(row and row[2] == "announced")
+    settings = get_bridge_settings(guild_id)
+    expected_marker = f"announced:{settings.get('voice_announce_channel_id')}"
+    announced = bool(settings.get("voice_announce_channel_id") and row and row[2] == expected_marker)
 
     try:
         while not stop_event.is_set():
@@ -1427,6 +1430,7 @@ async def _voice_room_worker(channel_id, guild_id, stop_event):
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                retry_connection = True
                 log.warning("Conexão da sala GoLive %s caiu: %s", handle, exc)
 
             if stop_event.is_set() or not retry_connection:
