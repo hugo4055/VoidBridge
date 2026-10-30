@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -23,6 +24,12 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 GOLIVE_TOKEN = os.getenv("GOLIVE_TOKEN", "").strip()
 if not DISCORD_TOKEN or not GOLIVE_TOKEN:
     raise SystemExit("Preencha DISCORD_TOKEN e GOLIVE_TOKEN no arquivo .env")
+
+# O portal copia "Bot <token>"; algumas integrações entregam só o token.
+# Aceitamos os dois formatos sem duplicar o prefixo.
+if GOLIVE_TOKEN.startswith("Bearer "):
+    raise SystemExit("GOLIVE_TOKEN deve ser o token de BOT do GoLive, não um token Bearer de usuário.")
+GOLIVE_CREDENTIAL = GOLIVE_TOKEN if GOLIVE_TOKEN.startswith("Bot ") else f"Bot {GOLIVE_TOKEN}"
 
 LOG_DIR = BASE / "logs"
 LOG_DIR.mkdir(exist_ok=True)
@@ -98,7 +105,7 @@ def clean_text(text, limit=5900):
 class GoLiveAPI:
     def __init__(self, session):
         self.session = session
-        self.headers = {"Authorization": f"Bot {GOLIVE_TOKEN}"}
+        self.headers = {"Authorization": GOLIVE_CREDENTIAL}
 
     async def request(self, method, path, **kwargs):
         async with self.session.request(
@@ -120,14 +127,23 @@ class GoLiveAPI:
                  account.get("displayName"), account.get("username"))
         return account
 
-    async def send_message(self, group_id, channel_id, text, attachments=None):
-        body = {"text": clean_text(text), "nonce": uuid.uuid4().hex}
+    async def send_message(self, group_id, channel_id, text, attachments=None, images=None):
+        body = {"text": clean_text(text, 2000), "nonce": uuid.uuid4().hex}
         if attachments:
             body["attachments"] = attachments[:5]
+        if images:
+            body["images"] = images[:3]
         return await self.request(
             "POST",
             f"/groups/{quote(str(group_id), safe='')}/channels/{quote(str(channel_id), safe='')}/messages",
             json=body,
+        )
+
+    async def edit_message(self, group_id, channel_id, message_id, text):
+        return await self.request(
+            "PATCH",
+            f"/groups/{quote(str(group_id), safe='')}/channels/{quote(str(channel_id), safe='')}/messages/{quote(str(message_id), safe='')}",
+            json={"text": clean_text(text, 2000)},
         )
 
     async def upload(self, filename, content_type, raw_bytes):
@@ -297,13 +313,16 @@ async def golive_gateway_loop():
             async with websockets.connect(
                 GATEWAY, ping_interval=25, ping_timeout=25, close_timeout=5
             ) as ws:
-                await ws.send(json.dumps({"type": "register", "token": f"Bot {GOLIVE_TOKEN}"}))
+                await ws.send(json.dumps({"type": "register", "token": GOLIVE_CREDENTIAL}))
                 async for raw in ws:
                     try:
                         event = json.loads(raw)
                     except json.JSONDecodeError:
                         continue
                     await handle_golive_event(event)
+                    if event.get("type") in ("register-error", "banned"):
+                        log.error("Autenticação GoLive recusada; verifique o token no .env.")
+                        return
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -329,24 +348,52 @@ async def on_message(message):
         return
     text = clean_text(message.clean_content)
     attachments = []
-    for attachment in message.attachments[:5]:
+    images = []
+    image_total = 0
+    supported_images = {"image/png", "image/jpeg", "image/webp", "image/gif", "image/avif"}
+
+    for attachment in message.attachments:
+        content_type = (attachment.content_type or "").lower().split(";")[0].strip()
+
+        if content_type.startswith("image/"):
+            if content_type not in supported_images:
+                text += f" [Imagem ignorada por formato não suportado: {attachment.filename}]"
+                continue
+            if len(images) >= 3 or attachment.size > 5 * 1024 * 1024 or image_total + attachment.size > 8 * 1024 * 1024:
+                text += f" [Imagem ignorada por limite do GoLive: {attachment.filename}]"
+                continue
+            try:
+                raw = await attachment.read()
+                if len(raw) > 5 * 1024 * 1024 or image_total + len(raw) > 8 * 1024 * 1024:
+                    text += f" [Imagem ignorada por limite do GoLive: {attachment.filename}]"
+                    continue
+                images.append(f"data:{content_type};base64,{base64.b64encode(raw).decode('ascii')}")
+                image_total += len(raw)
+            except Exception:
+                log.exception("Falha ao preparar imagem do Discord para GoLive")
+            continue
+
+        if len(attachments) >= 5:
+            text += f" [Arquivo ignorado: limite de 5 arquivos por mensagem ({attachment.filename})]"
+            continue
         if attachment.size > MAX_UPLOAD:
             text += f" [Arquivo ignorado por exceder {MAX_UPLOAD // (1024*1024)} MB: {attachment.filename}]"
             continue
         try:
             raw = await attachment.read()
             token = await golive_api.upload(
-                attachment.filename, attachment.content_type or "application/octet-stream", raw
+                attachment.filename, content_type or "application/octet-stream", raw
             )
             attachments.append(token)
         except Exception:
             log.exception("Falha ao enviar anexo do Discord para GoLive")
+
     author = message.author.display_name
     payload_text = f"{CONFIG.get('discord_prefix', '[Discord]')} {author}: {text}"
     try:
         result = await golive_api.send_message(
             bridge["golive_group_id"], bridge["golive_channel_id"],
-            payload_text, attachments
+            payload_text, attachments, images
         )
         sent = result.get("message", {})
         if sent.get("id"):
@@ -379,20 +426,13 @@ async def on_message_edit(before, after):
     mapped = get_map("discord", before.id)
     if not mapped:
         return
-    # A API pública do GoLive não oferece PATCH para editar mensagens.
-    # Apaga a mensagem antiga e publica a versão corrigida.
-    _, old_golive_id, _, group_id, channel_id = mapped
+    # A API REST atual oferece PATCH para editar mensagens do próprio bot.
+    _, golive_message_id, _, group_id, channel_id = mapped
     try:
-        await golive_api.delete_message(group_id, channel_id, old_golive_id)
-        result = await golive_api.send_message(
-            group_id, channel_id,
+        await golive_api.edit_message(
+            group_id, channel_id, golive_message_id,
             f"{CONFIG.get('discord_prefix', '[Discord]')} {after.author.display_name}: {clean_text(after.clean_content)}"
         )
-        new_message = result.get("message", {})
-        if new_message.get("id"):
-            save_map("discord", after.id, "golive", new_message["id"],
-                     discord_channel_id=after.channel.id,
-                     group_id=group_id, channel_id=channel_id)
     except Exception:
         log.exception("Falha ao sincronizar edição Discord → GoLive")
 
@@ -404,6 +444,11 @@ async def on_voice_state_update(member, before, after):
         return
     for bridge in BRIDGES:
         channel_id = bridge["discord_channel_id"]
+        discord_channel = bot.get_channel(int(channel_id))
+        if discord_channel is None or not hasattr(discord_channel, "guild"):
+            continue
+        if discord_channel.guild.id != member.guild.id:
+            continue
         if before.channel is None and after.channel:
             notice = f"[Discord] {member.display_name} entrou na chamada **{after.channel.name}**."
         elif after.channel is None and before.channel:
