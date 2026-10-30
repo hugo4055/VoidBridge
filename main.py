@@ -424,7 +424,7 @@ async def sync_structure():
             remote = await golive_api.get_group(GOLIVE_GROUP_ID)
             gl_cats = list(remote.get("categories", []) or [])
             gl_chans = list(remote.get("channels", []) or [])
-            dc_chans = list(guild.channels)
+            dc_chans = list(await guild.fetch_channels())
 
             # Categorias existentes no Discord: vincula por ID salvo ou nome.
             known = {r[0]: r for r in get_structure_maps("category")}
@@ -461,7 +461,7 @@ async def sync_structure():
                 save_structure_map("category", dc.id, gl["id"], dc.name)
 
             cat_rows = get_structure_maps("category")
-            gl_to_dc_cat = {r[1]: guild.get_channel(int(r[0])) for r in cat_rows}
+            gl_to_dc_cat = {r[1]: next((c for c in dc_chans if str(c.id) == r[0]), None) for r in cat_rows}
             dc_to_gl_cat = {int(r[0]): r[1] for r in cat_rows}
 
             # Canais Discord -> GoLive.
