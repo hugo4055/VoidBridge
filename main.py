@@ -529,6 +529,19 @@ def golive_role_snapshot(role):
 def role_snapshot_json(snapshot):
     return json.dumps(snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
+def merge_golive_role(old_role, payload):
+    merged = {**old_role, **payload}
+    if "permissions" in payload:
+        permissions = {
+            section: dict(values or {})
+            for section, values in (old_role.get("permissions") or {}).items()
+        }
+        for section, values in payload["permissions"].items():
+            permissions.setdefault(section, {}).update(values)
+        merged["permissions"] = permissions
+    return merged
+
+
 
 def parse_role_snapshot(value):
     try:
@@ -633,10 +646,10 @@ async def sync_roles(guild, remote):
                     golive_role["id"],
                     role_payload_for_golive(discord_snapshot, fields),
                 )
-                golive_role = response.get("role") or {
-                    **golive_role,
-                    **role_payload_for_golive(discord_snapshot, fields),
-                }
+                initial_payload = role_payload_for_golive(discord_snapshot, fields)
+                golive_role = response.get("role") or merge_golive_role(
+                    golive_role, initial_payload
+                )
                 golive_snapshot = golive_role_snapshot(golive_role)
             except Exception:
                 log.exception(
@@ -689,13 +702,11 @@ async def sync_roles(guild, remote):
         # dois lados alteraram o mesmo campo para valores diferentes.
         discord_to_golive = {
             key for key in discord_changes
-            if key not in conflicts
-            and (key not in golive_changes or discord_snapshot.get(key) == golive_snapshot.get(key))
+            if key not in golive_changes and key not in conflicts
         }
         golive_to_discord = {
             key for key in golive_changes
-            if key not in conflicts
-            and (key not in discord_changes or discord_snapshot.get(key) == golive_snapshot.get(key))
+            if key not in discord_changes and key not in conflicts
         }
 
         if not can_manage_golive_roles:
@@ -719,7 +730,7 @@ async def sync_roles(guild, remote):
                 response = await golive_api.edit_role(
                     GOLIVE_GROUP_ID, golive_id, payload
                 )
-                golive_role = response.get("role") or {**golive_role, **payload}
+                golive_role = response.get("role") or merge_golive_role(golive_role, payload)
                 golive_snapshot = golive_role_snapshot(golive_role)
             except Exception:
                 log.exception(
