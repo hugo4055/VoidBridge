@@ -5,7 +5,7 @@ import json
 import logging
 import os
 import secrets
-import sqlite3
+import psycopg
 import time
 import uuid
 from contextlib import contextmanager
@@ -27,6 +27,9 @@ API = "https://apigolive.nemtudo.me"
 GATEWAY = "wss://apigolive.nemtudo.me/ws"
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 GOLIVE_TOKEN = os.getenv("GOLIVE_TOKEN", "").strip()
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+if not DATABASE_URL:
+    raise SystemExit("Configure DATABASE_URL com a conexão PostgreSQL do Supabase.")
 GOLIVE_OAUTH_CLIENT_ID = os.getenv("GOLIVE_OAUTH_CLIENT_ID", "").strip()
 GOLIVE_OAUTH_CLIENT_SECRET = os.getenv("GOLIVE_OAUTH_CLIENT_SECRET", "").strip()
 OAUTH_REDIRECT_URI = os.getenv(
@@ -63,33 +66,15 @@ ANNOUNCE_VOICE = bool(CONFIG.get("announce_discord_voice", False))
 
 @contextmanager
 def db():
-    # O context manager padrão do sqlite faz commit/rollback, mas não fecha
-    # a conexão. Fechar explicitamente evita acumular conexões abertas.
-    con = sqlite3.connect(BASE / "state.sqlite3", timeout=15)
+    # Conexão PostgreSQL do Supabase. SSL obrigatório; prepare_threshold=None
+    # mantém compatibilidade com poolers em modo transaction.
+    con = psycopg.connect(
+        DATABASE_URL,
+        connect_timeout=10,
+        sslmode="require",
+        prepare_threshold=None,
+    )
     try:
-        con.execute("""CREATE TABLE IF NOT EXISTS message_map (
-            source_platform TEXT NOT NULL,
-            source_id TEXT NOT NULL,
-            destination_platform TEXT NOT NULL,
-            destination_id TEXT NOT NULL,
-            discord_channel_id TEXT,
-            golive_group_id TEXT,
-            golive_channel_id TEXT,
-            PRIMARY KEY(source_platform, source_id)
-        )""")
-        con.execute("""CREATE TABLE IF NOT EXISTS structure_map (
-            entity_type TEXT NOT NULL, discord_id TEXT NOT NULL, golive_id TEXT NOT NULL,
-            last_name TEXT NOT NULL, PRIMARY KEY(entity_type, discord_id),
-            UNIQUE(entity_type, golive_id)
-        )""")
-        con.execute("""CREATE TABLE IF NOT EXISTS link_codes (
-            code_hash TEXT PRIMARY KEY, discord_id TEXT NOT NULL,
-            expires_at INTEGER NOT NULL
-        )""")
-        con.execute("""CREATE TABLE IF NOT EXISTS account_links (
-            discord_id TEXT PRIMARY KEY, golive_user_id TEXT NOT NULL UNIQUE,
-            golive_username TEXT, linked_at INTEGER NOT NULL
-        )""")
         yield con
         con.commit()
     except Exception:
@@ -102,8 +87,16 @@ def save_map(source_platform, source_id, destination_platform, destination_id,
              discord_channel_id=None, group_id=None, channel_id=None):
     with db() as con:
         con.execute(
-            """INSERT OR REPLACE INTO message_map
-            VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            """INSERT INTO message_map (
+                source_platform, source_id, destination_platform, destination_id,
+                discord_channel_id, golive_group_id, golive_channel_id
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (source_platform, source_id) DO UPDATE SET
+                destination_platform=EXCLUDED.destination_platform,
+                destination_id=EXCLUDED.destination_id,
+                discord_channel_id=EXCLUDED.discord_channel_id,
+                golive_group_id=EXCLUDED.golive_group_id,
+                golive_channel_id=EXCLUDED.golive_channel_id""",
             (source_platform, str(source_id), destination_platform, str(destination_id),
              str(discord_channel_id) if discord_channel_id else None,
              group_id, channel_id),
@@ -114,7 +107,7 @@ def get_map(source_platform, source_id):
         row = con.execute(
             """SELECT destination_platform, destination_id, discord_channel_id,
                       golive_group_id, golive_channel_id
-               FROM message_map WHERE source_platform=? AND source_id=?""",
+               FROM message_map WHERE source_platform=%s AND source_id=%s""",
             (source_platform, str(source_id)),
         ).fetchone()
     return row
@@ -122,25 +115,25 @@ def get_map(source_platform, source_id):
 def remove_map(source_platform, source_id):
     with db() as con:
         con.execute(
-            "DELETE FROM message_map WHERE source_platform=? AND source_id=?",
+            "DELETE FROM message_map WHERE source_platform=%s AND source_id=%s",
             (source_platform, str(source_id)),
         )
 
 def get_structure_maps(kind):
     with db() as con:
-        return con.execute("SELECT discord_id, golive_id, last_name FROM structure_map WHERE entity_type=?", (kind,)).fetchall()
+        return con.execute("SELECT discord_id, golive_id, last_name FROM structure_map WHERE entity_type=%s", (kind,)).fetchall()
 
 def get_structure_map_by_discord(kind, ident):
     with db() as con:
-        return con.execute("SELECT discord_id, golive_id, last_name FROM structure_map WHERE entity_type=? AND discord_id=?", (kind, str(ident))).fetchone()
+        return con.execute("SELECT discord_id, golive_id, last_name FROM structure_map WHERE entity_type=%s AND discord_id=%s", (kind, str(ident))).fetchone()
 
 def get_structure_map_by_golive(kind, ident):
     with db() as con:
-        return con.execute("SELECT discord_id, golive_id, last_name FROM structure_map WHERE entity_type=? AND golive_id=?", (kind, str(ident))).fetchone()
+        return con.execute("SELECT discord_id, golive_id, last_name FROM structure_map WHERE entity_type=%s AND golive_id=%s", (kind, str(ident))).fetchone()
 
 def save_structure_map(kind, discord_id, golive_id, name):
     with db() as con:
-        con.execute("""INSERT INTO structure_map VALUES (?, ?, ?, ?)
+        con.execute("""INSERT INTO structure_map VALUES (%s, %s, %s, %s)
             ON CONFLICT(entity_type, discord_id) DO UPDATE SET
             golive_id=excluded.golive_id, last_name=excluded.last_name""",
             (kind, str(discord_id), str(golive_id), str(name)))
@@ -713,28 +706,29 @@ LINK_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
 
 def create_link_code(discord_id):
-    """Gera um código de uso único; somente o hash fica salvo no SQLite."""
+    """Gera um código de uso único; somente o hash fica salvo no Supabase."""
     with db() as con:
-        con.execute("DELETE FROM link_codes WHERE expires_at < ?", (int(time.time()),))
-        con.execute("DELETE FROM link_codes WHERE discord_id=?", (str(discord_id),))
+        con.execute("DELETE FROM link_codes WHERE expires_at < %s", (int(time.time()),))
+        con.execute("DELETE FROM link_codes WHERE discord_id=%s", (str(discord_id),))
         for _ in range(20):
             raw = "".join(secrets.choice(LINK_CODE_ALPHABET) for _ in range(6))
             code = raw[:3] + "-" + raw[3:]
             digest = hashlib.sha256(code.encode("ascii")).hexdigest()
-            try:
-                con.execute(
-                    "INSERT INTO link_codes(code_hash, discord_id, expires_at) VALUES (?, ?, ?)",
-                    (digest, str(discord_id), int(time.time()) + LINK_CODE_TTL),
-                )
+            inserted = con.execute(
+                """INSERT INTO link_codes(code_hash, discord_id, expires_at)
+                   VALUES (%s, %s, %s)
+                   ON CONFLICT (code_hash) DO NOTHING
+                   RETURNING code_hash""",
+                (digest, str(discord_id), int(time.time()) + LINK_CODE_TTL),
+            ).fetchone()
+            if inserted:
                 return code
-            except sqlite3.IntegrityError:
-                continue
     raise RuntimeError("Não foi possível gerar um código único. Tente novamente.")
 
 
 def invalidate_link_code(discord_id):
     with db() as con:
-        con.execute("DELETE FROM link_codes WHERE discord_id=?", (str(discord_id),))
+        con.execute("DELETE FROM link_codes WHERE discord_id=%s", (str(discord_id),))
 
 
 def consume_link_code(code, golive_user):
@@ -743,20 +737,20 @@ def consume_link_code(code, golive_user):
     now = int(time.time())
     with db() as con:
         row = con.execute(
-            "SELECT discord_id, expires_at FROM link_codes WHERE code_hash=?",
+            "SELECT discord_id, expires_at FROM link_codes WHERE code_hash=%s",
             (digest,),
         ).fetchone()
         if not row:
             return "Código inválido ou já utilizado. Gere outro com /vincular no Discord."
         discord_id, expires_at = row
-        con.execute("DELETE FROM link_codes WHERE code_hash=?", (digest,))
+        con.execute("DELETE FROM link_codes WHERE code_hash=%s", (digest,))
         if expires_at < now:
             return "Esse código expirou. Volte ao Discord e use /vincular para gerar outro."
         golive_id = str(golive_user.get("id") or "")
         if not golive_id:
             return "Não consegui identificar sua conta GoLive. Tente novamente."
         existing = con.execute(
-            "SELECT discord_id FROM account_links WHERE golive_user_id=?",
+            "SELECT discord_id FROM account_links WHERE golive_user_id=%s",
             (golive_id,),
         ).fetchone()
         if existing and existing[0] != discord_id:
@@ -766,7 +760,7 @@ def consume_link_code(code, golive_user):
         )[:100]
         con.execute(
             """INSERT INTO account_links(discord_id, golive_user_id, golive_username, linked_at)
-               VALUES (?, ?, ?, ?)
+               VALUES (%s, %s, %s, %s)
                ON CONFLICT(discord_id) DO UPDATE SET
                golive_user_id=excluded.golive_user_id,
                golive_username=excluded.golive_username,
@@ -804,7 +798,7 @@ async def link_golive_account(interaction: discord.Interaction):
 async def show_golive_link(interaction: discord.Interaction):
     with db() as con:
         row = con.execute(
-            "SELECT golive_username FROM account_links WHERE discord_id=?",
+            "SELECT golive_username FROM account_links WHERE discord_id=%s",
             (str(interaction.user.id),),
         ).fetchone()
     if row:
@@ -825,6 +819,10 @@ async def health_check(_request):
 
 async def main():
     global http_session, golive_api
+    # Testa a conexão do banco antes de iniciar os gateways.
+    with db() as con:
+        con.execute("SELECT 1")
+    log.info("Supabase PostgreSQL conectado.")
     timeout = aiohttp.ClientTimeout(total=45)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         http_session = session
