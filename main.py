@@ -123,6 +123,8 @@ class GoLiveAPI:
     async def verify(self):
         data = await self.request("GET", "/auth/me")
         account = data.get("account", {})
+        if not account.get("bot", False):
+            raise RuntimeError("O token autenticou, mas a conta não está marcada como bot no GoLive.")
         log.info("GoLive autenticado como %s (@%s)",
                  account.get("displayName"), account.get("username"))
         return account
