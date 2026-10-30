@@ -64,6 +64,18 @@ if not GOLIVE_GROUP_ID or not DISCORD_GROUP_ID:
 MAX_UPLOAD = int(CONFIG.get("max_upload_mb", 20)) * 1024 * 1024
 ANNOUNCE_VOICE = bool(CONFIG.get("announce_discord_voice", False))
 
+# Eleição de líder compartilhada entre Render (primary) e Replit (backup).
+INSTANCE_ROLE = os.getenv("INSTANCE_ROLE", "primary").strip().lower()
+if INSTANCE_ROLE not in ("primary", "backup"):
+    raise SystemExit("INSTANCE_ROLE deve ser 'primary' ou 'backup'.")
+INSTANCE_ID = os.getenv("INSTANCE_ID", "").strip() or str(uuid.uuid4())
+LEASE_KEY = "voidbridge-main"
+LEASE_TTL_SECONDS = max(30, int(os.getenv("LEASE_TTL_SECONDS", "45")))
+LEASE_HEARTBEAT_SECONDS = max(5, min(LEASE_TTL_SECONDS // 3, 15))
+LEASE_POLL_SECONDS = max(3, int(os.getenv("LEASE_POLL_SECONDS", "8")))
+leader_active = False
+lease_heartbeat_task = None
+
 @contextmanager
 def db():
     # Conexão PostgreSQL do Supabase. SSL obrigatório; prepare_threshold=None
@@ -82,6 +94,69 @@ def db():
         raise
     finally:
         con.close()
+
+def try_acquire_leader_lease():
+    """Aquisição atômica; somente um processo pode ser líder por vez."""
+    with db() as con:
+        row = con.execute(
+            """INSERT INTO voidbridge_leader_lease
+                   (lease_key, owner_id, owner_role, expires_at, updated_at)
+               VALUES (%s, %s, %s, now() + make_interval(secs => %s), now())
+               ON CONFLICT (lease_key) DO UPDATE SET
+                   owner_id = EXCLUDED.owner_id,
+                   owner_role = EXCLUDED.owner_role,
+                   expires_at = EXCLUDED.expires_at,
+                   updated_at = now()
+               WHERE voidbridge_leader_lease.expires_at <= now()
+                  OR voidbridge_leader_lease.owner_id = EXCLUDED.owner_id
+               RETURNING owner_id""",
+            (LEASE_KEY, INSTANCE_ID, INSTANCE_ROLE, LEASE_TTL_SECONDS),
+        ).fetchone()
+    return bool(row and row[0] == INSTANCE_ID)
+
+
+def renew_leader_lease():
+    """Renova apenas uma concessão ainda válida pertencente a este processo."""
+    with db() as con:
+        row = con.execute(
+            """UPDATE voidbridge_leader_lease
+               SET expires_at = now() + make_interval(secs => %s),
+                   updated_at = now()
+               WHERE lease_key = %s AND owner_id = %s AND expires_at > now()
+               RETURNING owner_id""",
+            (LEASE_TTL_SECONDS, LEASE_KEY, INSTANCE_ID),
+        ).fetchone()
+    return bool(row and row[0] == INSTANCE_ID)
+
+
+def release_leader_lease():
+    """Libera a concessão somente se ela ainda pertencer a este processo."""
+    with db() as con:
+        con.execute(
+            """UPDATE voidbridge_leader_lease
+               SET expires_at = now(), updated_at = now()
+               WHERE lease_key = %s AND owner_id = %s""",
+            (LEASE_KEY, INSTANCE_ID),
+        )
+
+
+async def leader_heartbeat():
+    global leader_active
+    while leader_active:
+        await asyncio.sleep(LEASE_HEARTBEAT_SECONDS)
+        try:
+            if renew_leader_lease():
+                continue
+            log.critical("A concessão de líder foi perdida; desligando os gateways.")
+        except Exception:
+            log.exception("Não foi possível renovar a concessão; desligando por segurança.")
+        leader_active = False
+        task = globals().get("golive_task")
+        if task and not task.done():
+            task.cancel()
+        await bot.close()
+        return
+
 
 def save_map(source_platform, source_id, destination_platform, destination_id,
              discord_channel_id=None, group_id=None, channel_id=None):
@@ -995,6 +1070,10 @@ async def sync_structure():
 
 @bot.event
 async def on_ready():
+    global golive_task
+    if not leader_active:
+        await bot.close()
+        return
     log.info("Discord conectado como %s", bot.user)
     if not getattr(bot, "_commands_synced", False):
         try:
@@ -1005,7 +1084,7 @@ async def on_ready():
             log.exception("Não foi possível sincronizar os comandos slash.")
     if not getattr(bot, "_golive_started", False):
         bot._golive_started = True
-        asyncio.create_task(golive_gateway_loop())
+        golive_task = asyncio.create_task(golive_gateway_loop())
         asyncio.create_task(sync_structure())
 
 @bot.event
@@ -1283,15 +1362,20 @@ async def show_golive_link(interaction: discord.Interaction):
 
 
 async def health_check(_request):
-    return web.json_response({"ok": True, "service": "VoidBridge"})
+    return web.json_response({
+        "ok": True,
+        "service": "VoidBridge",
+        "role": INSTANCE_ROLE,
+        "active": leader_active,
+        "state": "active" if leader_active else "standby",
+    })
 
 
 async def main():
-    global http_session, golive_api
-    # Testa a conexão do banco antes de iniciar os gateways.
+    global http_session, golive_api, leader_active, lease_heartbeat_task
     with db() as con:
         con.execute("SELECT 1")
-    log.info("Supabase PostgreSQL conectado.")
+    log.info("Supabase PostgreSQL conectado. Papel desta instância: %s.", INSTANCE_ROLE)
     timeout = aiohttp.ClientTimeout(total=45)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         http_session = session
@@ -1300,22 +1384,51 @@ async def main():
         app.router.add_get("/health", health_check)
         runner = web.AppRunner(app)
         await runner.setup()
-        site = web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", "10000")))
+        site = web.TCPSite(app_runner=runner, host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
         await site.start()
-        log.info("Health check disponível em /health; vinculação por código ativada.")
-        # A API pode responder 503 retryable durante uma inicialização/manutenção.
-        # Nessa situação aguardamos e tentamos novamente, sem derrubar o bot.
-        while True:
+        log.info("Health check disponível em /health.")
+
+        # Render é primary; Replit fica aguardando até a concessão expirar.
+        while not leader_active:
             try:
-                await golive_api.verify()
-                break
-            except GoLiveAPIError as exc:
-                if exc.status == 503 and isinstance(exc.data, dict) and exc.data.get("retryable"):
-                    log.warning("API GoLive temporariamente indisponível; nova tentativa em 10 segundos.")
-                    await asyncio.sleep(10)
-                    continue
-                raise
-        await bot.start(DISCORD_TOKEN)
+                if try_acquire_leader_lease():
+                    leader_active = True
+                    log.warning("Liderança VoidBridge adquirida por %s (%s).", INSTANCE_ROLE, INSTANCE_ID)
+                    break
+            except Exception:
+                log.exception("Falha ao consultar a concessão; permanecendo em standby.")
+            await asyncio.sleep(LEASE_POLL_SECONDS)
+
+        lease_heartbeat_task = asyncio.create_task(leader_heartbeat())
+        try:
+            # A API pode responder 503 retryable durante uma inicialização/manutenção.
+            while leader_active:
+                try:
+                    await golive_api.verify()
+                    break
+                except GoLiveAPIError as exc:
+                    if exc.status == 503 and isinstance(exc.data, dict) and exc.data.get("retryable"):
+                        log.warning("API GoLive temporariamente indisponível; nova tentativa em 10 segundos.")
+                        await asyncio.sleep(10)
+                        continue
+                    raise
+            if leader_active:
+                await bot.start(DISCORD_TOKEN)
+        finally:
+            leader_active = False
+            if lease_heartbeat_task and not lease_heartbeat_task.done():
+                lease_heartbeat_task.cancel()
+                await asyncio.gather(lease_heartbeat_task, return_exceptions=True)
+            task = globals().get("golive_task")
+            if task and not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            try:
+                release_leader_lease()
+                log.info("Concessão de líder liberada.")
+            except Exception:
+                log.exception("Não foi possível liberar a concessão; ela expirará automaticamente.")
+            await runner.cleanup()
 
 if __name__ == "__main__":
     try:
